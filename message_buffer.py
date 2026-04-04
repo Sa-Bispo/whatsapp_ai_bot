@@ -1310,6 +1310,19 @@ async def handle_debounce(chat_id: str):
         log(f'Debounce cancelado para {chat_id}')
     except Exception as error:
         log(f'Erro inesperado no debounce de {chat_id}: {error}')
+        fallback_message = (
+            '⚠️ Tive um problema técnico para processar sua mensagem agora. '
+            'Tente novamente em instantes ou digite *menu* para continuar.'
+        )
+        if 'invalid_api_key' in str(error).lower() or 'incorrect api key' in str(error).lower():
+            fallback_message = (
+                '⚠️ Nosso assistente está temporariamente indisponível por configuração interna. '
+                'Digite *menu* para continuar no atendimento ou tente novamente em instantes.'
+            )
+        try:
+            send_whatsapp_message(number=chat_id, text=fallback_message)
+        except Exception as send_error:
+            log(f'Falha ao enviar fallback para {chat_id}: {send_error}')
         try:
             await redis_client.delete(buffer_key)
         except Exception as delete_error:
