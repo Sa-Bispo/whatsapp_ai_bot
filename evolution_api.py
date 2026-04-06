@@ -11,8 +11,16 @@ from config import (
 )
 
 
-def send_whatsapp_message(number, text):
-    url = f'{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE_NAME}'
+def _resolve_instance_name(instance_name: str | None) -> str:
+    instance = (instance_name or EVOLUTION_INSTANCE_NAME or '').strip()
+    if not instance:
+        raise RuntimeError('EVOLUTION_INSTANCE_NAME não configurado e instance_name não informado.')
+    return instance
+
+
+def send_whatsapp_message(number, text, instance_name=None):
+    instance = _resolve_instance_name(instance_name)
+    url = f'{EVOLUTION_API_URL}/message/sendText/{instance}'
     headers = {
         'apikey': EVOLUTION_AUTHENTICATION_API_KEY,
         'Content-Type': 'application/json'
@@ -30,8 +38,9 @@ def send_whatsapp_message(number, text):
     response.raise_for_status()
 
 
-def send_whatsapp_presence(number, presence='composing', delay=2500):
-    url = f'{EVOLUTION_API_URL}/chat/sendPresence/{EVOLUTION_INSTANCE_NAME}'
+def send_whatsapp_presence(number, presence='composing', delay=2500, instance_name=None):
+    instance = _resolve_instance_name(instance_name)
+    url = f'{EVOLUTION_API_URL}/chat/sendPresence/{instance}'
     headers = {
         'apikey': EVOLUTION_AUTHENTICATION_API_KEY,
         'Content-Type': 'application/json'
@@ -50,8 +59,9 @@ def send_whatsapp_presence(number, presence='composing', delay=2500):
     response.raise_for_status()
 
 
-def send_whatsapp_media(number, caption, media, mediatype='image', file_name=None, mimetype=None):
-    url = f'{EVOLUTION_API_URL}/message/sendMedia/{EVOLUTION_INSTANCE_NAME}'
+def send_whatsapp_media(number, caption, media, mediatype='image', file_name=None, mimetype=None, instance_name=None):
+    instance = _resolve_instance_name(instance_name)
+    url = f'{EVOLUTION_API_URL}/message/sendMedia/{instance}'
     headers = {
         'apikey': EVOLUTION_AUTHENTICATION_API_KEY,
         'Content-Type': 'application/json'
@@ -80,7 +90,7 @@ def send_whatsapp_media(number, caption, media, mediatype='image', file_name=Non
     response.raise_for_status()
 
 
-def send_whatsapp_image_file(number, file_path, caption=''):
+def send_whatsapp_image_file(number, file_path, caption='', instance_name=None):
     path = Path(file_path)
 
     with path.open('rb') as image_file:
@@ -95,4 +105,5 @@ def send_whatsapp_image_file(number, file_path, caption=''):
         mediatype='image',
         file_name=path.name,
         mimetype=detected_mimetype,
+        instance_name=instance_name,
     )
