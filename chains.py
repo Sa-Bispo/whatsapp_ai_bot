@@ -1,11 +1,14 @@
 import re
+import json
+import asyncio
+import traceback
 
 from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI
 from google import genai
+from google.genai import types
 
 from config import (
     OPENAI_API_KEY,
@@ -14,6 +17,7 @@ from config import (
     GEMINI_API_KEY,
     GEMINI_MODEL_NAME,
 )
+from database_api import fetch_active_produtos, get_tenant_configs
 from memory import get_session_history
 from vectorstore import get_vectorstore
 from prompts import contextualize_prompt, qa_prompt
@@ -48,6 +52,12 @@ _PERSONA_SYSTEM_PROMPT = (
     'Seja natural, pragmático e orientado à conversão com o menor número de mensagens possível.'
 )
 
+_CATALOGO_GOLD_RULE = (
+    'Atenção: Você só pode oferecer e vender os produtos que estão listados no CATÁLOGO abaixo. '
+    'Respeite rigorosamente as regras de Variações, Extras e Limites descritas no contexto de cada item. '
+    'Não invente produtos ou preços.'
+)
+
 _WHATSAPP_HARD_RULES = (
     'REGRAS GERAIS (nunca quebre):\n'
     '1) NUNCA envie links externos. Todo atendimento acontece aqui no chat.\n'
@@ -62,12 +72,14 @@ _FUNNEL_MODULES_RULES: dict[str, str] = {
         'MÓDULO: FECHAR PEDIDO (varejo/alimentação).\n'
         'CHECKLIST OBRIGATÓRIO: 1) item(ns), 2) tamanho/quantidade, 3) endereço completo, 4) pagamento.\n'
         'Se cliente mandar pedido + endereço na mesma frase, peça imediatamente os faltantes (tamanho/quantidade e pagamento).\n'
+        'VOCÊ JÁ TEM TODOS OS DADOS? Se sim, responda APENAS com o resumo do pedido formatado para WhatsApp, '
+        'liste os itens, endereço e forma de pagamento, e encerre com o emoji ✅. Não diga mais nada.\n'
         'TEMPLATE FINAL OBRIGATÓRIO:\n\n'
-        '*Pedido Confirmado!* ✅\n\n'
+        '*Resumo do Pedido*\n'
         '🛒 *Itens:* [lista detalhada com tamanhos]\n'
         '📍 *Endereço:* [endereço completo do cliente]\n'
-        '💳 *Pagamento:* [forma escolhida]\n\n'
-        '_Obrigado! Seu pedido já foi enviado para a cozinha._'
+        '💳 *Pagamento:* [forma escolhida]\n'
+        '✅'
     ),
     'AGENDAR': (
         'MÓDULO: AGENDAR HORÁRIO (serviços/clínicas).\n'
@@ -99,10 +111,81 @@ _LEADING_ROBOTIC_WORDS = re.compile(
 _URL_PATTERN = re.compile(r'https?://\S+|www\.\S+', flags=re.IGNORECASE)
 
 _FINAL_MARKERS = {
-    'FECHAR_PEDIDO': 'pedido confirmado',
+    'FECHAR_PEDIDO': '✅',
     'AGENDAR': 'agendamento confirmado',
     'TIRAR_DUVIDAS': 'atendimento encerrado',
 }
+
+
+async def get_cardapio_context(tenant_id: str) -> str:
+    """Traduz o catálogo híbrido ativo do tenant para contexto legível ao LLM."""
+    normalized_tenant_id = (tenant_id or '').strip()
+    if not normalized_tenant_id:
+        return 'Nenhum tenant_id informado para carregar catálogo.'
+
+    produtos = await fetch_active_produtos(normalized_tenant_id)
+    if not produtos:
+        # Fallback para tenants de test-drive sem seed em `produtos`.
+        tenant_configs = await get_tenant_configs(normalized_tenant_id)
+        tenant_prompt = str(tenant_configs.get('promptIa') or '').strip()
+
+        if tenant_prompt:
+            marker = '--- INFORMAÇÕES DO SEU NEGÓCIO ---'
+            if marker in tenant_prompt:
+                business_context = tenant_prompt.split(marker, maxsplit=1)[1].strip()
+                if business_context:
+                    return (
+                        'Catálogo estruturado (produtos ativos) ainda não encontrado para esta loja.\n'
+                        'Use temporariamente o contexto textual abaixo como catálogo válido:\n\n'
+                        f'{business_context}'
+                    )
+
+            return (
+                'Catálogo estruturado (produtos ativos) ainda não encontrado para esta loja.\n'
+                'Use temporariamente o prompt operacional do lojista para responder com precisão:\n\n'
+                f'{tenant_prompt}'
+            )
+
+        return 'Nenhum produto ativo encontrado para esta loja no momento.'
+
+    lines: list[str] = []
+    lines.append('Produtos ativos da loja:')
+
+    for index, produto in enumerate(produtos, start=1):
+        nome = str(produto.get('nome') or '').strip() or 'Produto sem nome'
+        categoria = str(produto.get('categoria') or '').strip() or 'Sem categoria'
+        classe_negocio = str(produto.get('classe_negocio') or '').strip() or 'generico'
+        preco_base_raw = produto.get('preco_base')
+        regras_ia = str(produto.get('regras_ia') or '').strip()
+
+        try:
+            preco_base = float(preco_base_raw)
+            preco_text = f'R$ {preco_base:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+        except (TypeError, ValueError):
+            preco_text = str(preco_base_raw or 'não informado')
+
+        config_nicho = produto.get('config_nicho') or {}
+        if isinstance(config_nicho, str):
+            try:
+                config_nicho = json.loads(config_nicho)
+            except json.JSONDecodeError:
+                config_nicho = {'raw': config_nicho}
+
+        config_pretty = json.dumps(config_nicho, ensure_ascii=False, indent=2)
+
+        lines.append(f'\n### Item {index}')
+        lines.append(f'- Nome: {nome}')
+        lines.append(f'- Categoria: {categoria}')
+        lines.append(f'- Classe do Negócio: {classe_negocio}')
+        lines.append(f'- Preço Base: {preco_text}')
+        lines.append('- Configurações do Nicho (JSON):')
+        lines.append('```json')
+        lines.append(config_pretty)
+        lines.append('```')
+        if regras_ia:
+            lines.append(f'- Regras IA do lojista: {regras_ia}')
+
+    return '\n'.join(lines)
 
 
 def _normalize_objective(value: str | None) -> str:
@@ -232,6 +315,32 @@ def _contains_order_signal(text: str) -> bool:
     return any(k in normalized for k in keywords)
 
 
+def _extract_payment_label(text: str) -> str:
+    normalized = (text or '').lower()
+    if 'pix' in normalized:
+        return 'Pix'
+    if any(token in normalized for token in ('cartao', 'cartão', 'credito', 'crédito', 'debito', 'débito')):
+        return 'Cartão'
+    if 'dinheiro' in normalized:
+        return 'Dinheiro'
+    return '[forma escolhida]'
+
+
+def _extract_order_context_from_history(history_window, user_message: str) -> tuple[str, str, str]:
+    human_texts = [str(msg.content).strip() for msg in history_window if msg.type == 'human']
+    if user_message.strip():
+        human_texts.append(user_message.strip())
+
+    product_lines = [text for text in human_texts if _contains_order_signal(text)]
+    address_lines = [text for text in human_texts if _contains_address_signal(text)]
+    corpus = ' '.join(human_texts)
+
+    items = product_lines[-1] if product_lines else '[itens informados pelo cliente]'
+    address = address_lines[-1] if address_lines else '[endereço informado pelo cliente]'
+    payment = _extract_payment_label(corpus)
+    return items, address, payment
+
+
 def _extract_summary_field(text: str, pattern: str) -> str:
     match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
     if not match:
@@ -245,11 +354,11 @@ def _format_order_final_summary(items: str, address: str, payment: str) -> str:
     safe_payment = payment or '[forma escolhida]'
 
     return (
-        '*Pedido Confirmado!* ✅\n\n'
+        '*Resumo do Pedido*\n'
         f'🛒 *Itens:* {safe_items}\n'
         f'📍 *Endereço:* {safe_address}\n'
-        f'💳 *Pagamento:* {safe_payment}\n\n'
-        '_Obrigado! Seu pedido já foi enviado para a cozinha._'
+        f'💳 *Pagamento:* {safe_payment}\n'
+        '✅'
     )
 
 
@@ -306,6 +415,9 @@ def _format_faq_final_summary() -> str:
 
 
 def _is_final_message(text: str, objective: str) -> bool:
+    if objective == 'FECHAR_PEDIDO':
+        return (text or '').rstrip().endswith('✅')
+
     marker = _FINAL_MARKERS.get(objective, 'pedido confirmado')
     return marker in (text or '').lower()
 
@@ -351,6 +463,8 @@ def _enforce_sales_funnel(
 ) -> str:
     cleaned = _sanitize_persona_response(model_reply, objective)
 
+    missing = _infer_missing_checklist(history_window, user_message, objective)
+
     if objective == 'TIRAR_DUVIDAS' and _should_close_faq(user_message):
         return _format_faq_final_summary()
 
@@ -361,7 +475,13 @@ def _enforce_sales_funnel(
     if _is_final_message(cleaned, objective):
         return cleaned
 
-    missing = _infer_missing_checklist(history_window, user_message, objective)
+    if objective == 'FECHAR_PEDIDO' and not any(missing.values()):
+        items, address, payment = _extract_order_context_from_history(
+            history_window,
+            user_message,
+        )
+        return _format_order_final_summary(items, address, payment)
+
     next_question = _next_question_from_missing(missing, objective)
     if not next_question:
         return cleaned
@@ -377,14 +497,40 @@ def _openai_key_is_configured() -> bool:
     return bool(key and key.upper() != 'YOUR_KEY')
 
 
+def _provider_unavailable_fallback(
+    objective: str,
+    history_window,
+    user_message: str,
+) -> str:
+    if objective == 'AGENDAR':
+        missing = _infer_missing_checklist(history_window, user_message, objective)
+        next_question = _next_question_from_missing(missing, objective)
+        return next_question or 'Perfeito. Vou confirmar seu agendamento.'
+
+    if objective == 'TIRAR_DUVIDAS':
+        return 'Pode me dizer sua dúvida em uma frase?'
+
+    missing = _infer_missing_checklist(history_window, user_message, objective)
+    next_question = _next_question_from_missing(missing, objective)
+    if next_question:
+        return next_question
+
+    return _format_order_final_summary(
+        items='[itens informados pelo cliente]',
+        address='[endereço informado pelo cliente]',
+        payment='[pagamento informado pelo cliente]',
+    )
+
+
 def generate_persona_response(
     instruction: str,
     user_message: str,
     session_id: str,
     persona_system_prompt: str | None = None,
     objective_mode: str | None = None,
+    tenant_id: str | None = None,
 ) -> str:
-    """Generates a persona-styled response preferring Gemini; OpenAI is fallback."""
+    """Generates a persona-styled response using Gemini official SDK."""
     history = get_session_history(session_id)
     objective = _normalize_objective(objective_mode)
     base_prompt = (persona_system_prompt or '').strip() or _PERSONA_SYSTEM_PROMPT
@@ -398,7 +544,22 @@ def generate_persona_response(
             'priorizando tamanho/quantidade e forma de pagamento na mesma resposta.'
         )
 
-    effective_system_prompt = f'{base_prompt}\n\n{_WHATSAPP_HARD_RULES}\n\n{module_rules}'
+    cardapio_context = 'Catálogo indisponível no momento.'
+    normalized_tenant_id = (tenant_id or '').strip()
+    if normalized_tenant_id:
+        try:
+            cardapio_context = asyncio.run(get_cardapio_context(normalized_tenant_id))
+        except Exception as error:
+            cardapio_context = f'Falha ao carregar catálogo do tenant: {error}'
+
+    effective_system_prompt = (
+        f'{base_prompt}\n\n'
+        f'{_WHATSAPP_HARD_RULES}\n\n'
+        f'{_CATALOGO_GOLD_RULE}\n\n'
+        f'[CATÁLOGO DA LOJA E REGRAS]\n'
+        f'{cardapio_context}\n\n'
+        f'{module_rules}'
+    )
     if dynamic_hint:
         effective_system_prompt = f'{effective_system_prompt}\n\n{dynamic_hint}'
 
@@ -409,54 +570,54 @@ def generate_persona_response(
         role = 'Usuário' if msg.type == 'human' else 'Assistente'
         history_lines.append(f'{role}: {msg.content}')
 
-    prompt = (
-        f"{effective_system_prompt}\n\n"
-        f"INSTRUÇÃO DO SISTEMA: {instruction}\n\n"
-        f"Histórico recente:\n{chr(10).join(history_lines) if history_lines else '(sem histórico)'}\n\n"
-        f"Mensagem atual do usuário: {user_message}\n\n"
-        "Responda em português do Brasil."
-    )
-
     content = ''
+    gemini_error: str | None = None
 
     if GEMINI_API_KEY and GEMINI_API_KEY.strip():
-        client = genai.Client(api_key=GEMINI_API_KEY.strip())
-        response = client.models.generate_content(
-            model=GEMINI_MODEL_NAME,
-            contents=prompt,
-        )
-        content = (getattr(response, 'text', None) or '').strip()
+        try:
+            client = genai.Client(api_key=GEMINI_API_KEY.strip())
+            gemini_user_prompt = (
+                f'Histórico recente:\n{chr(10).join(history_lines) if history_lines else "(sem histórico)"}\n\n'
+                f'Mensagem atual do usuário: {user_message}\n\n'
+                'Responda em português do Brasil.'
+            )
+
+            response = client.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents=gemini_user_prompt,
+                config=types.GenerateContentConfig(
+                    temperature=OPENAI_MODEL_TEMPERATURE,
+                    system_instruction=(
+                        f'{effective_system_prompt}\n\n'
+                        f'INSTRUÇÃO DO SISTEMA: {instruction}'
+                    ),
+                ),
+            )
+
+            content = (getattr(response, 'text', None) or '').strip()
+        except Exception as e:
+            print("\n" + "=" * 50)
+            print(f"🔥 ERRO FATAL NA CHAMADA DA IA (GEMINI): {str(e)}")
+            print("=" * 50)
+            traceback.print_exc()
+            print("=" * 50 + "\n")
+            gemini_error = str(e)
 
     if not content:
-        if not _openai_key_is_configured():
-            raise RuntimeError('Nenhuma chave de IA válida configurada (GEMINI_API_KEY/OPENAI_API_KEY).')
-
-        llm = ChatOpenAI(
-            model=OPENAI_MODEL_NAME,
-            temperature=0.7,
+        reasons: list[str] = []
+        if gemini_error:
+            reasons.append(f'Gemini falhou: {gemini_error}')
+        if not GEMINI_API_KEY:
+            reasons.append('Nenhuma chave de IA válida configurada (GEMINI_API_KEY).')
+        # Mantém o atendimento vivo mesmo com indisponibilidade temporária de provedores.
+        # O motivo pode ser útil para troubleshooting via logs.
+        reason_text = ' | '.join(reasons) if reasons else 'Falha desconhecida ao gerar conteúdo.'
+        print(f'[LLM-FALLBACK] {reason_text}')
+        content = _provider_unavailable_fallback(
+            objective,
+            history_window,
+            user_message,
         )
-
-        openai_messages = [
-            SystemMessage(
-                content=(
-                    f'{effective_system_prompt}\n\n'
-                    f'INSTRUÇÃO DO SISTEMA: {instruction}'
-                )
-            )
-        ]
-
-        for msg in history_window:
-            if msg.type == 'human':
-                openai_messages.append(HumanMessage(content=str(msg.content)))
-            elif msg.type in {'ai', 'assistant'}:
-                openai_messages.append(AIMessage(content=str(msg.content)))
-
-        openai_messages.append(HumanMessage(content=user_message))
-
-        response = llm.invoke(
-            openai_messages
-        )
-        content = str(response.content).strip()
 
     content = _enforce_sales_funnel(
         content,

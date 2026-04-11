@@ -1,15 +1,52 @@
 import asyncio
+import json
 import re
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field
 
 from chains import generate_persona_response
-from database_api import get_tenant_by_instance, get_tenant_configs
+from database_api import get_tenant_by_instance, get_tenant_configs, create_produto
 from message_buffer import buffer_message
+from config import GEMINI_API_KEY
 
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+    ],
+    allow_credentials=True,
+    allow_methods=['*'],
+    allow_headers=['*'],
+)
+
+
+# ============================================================================
+# Modelos Pydantic para Visão Computacional (Import de Cardápio)
+# ============================================================================
+
+class ProdutoVisionResponse(BaseModel):
+    """Schema para um produto extraído por visão computacional."""
+    nome: str
+    preco_base: float
+    categoria: str
+    regras_ia: str = Field(default='')
+
+
+class ProdutosVisionList(BaseModel):
+    """Array de produtos extraído pela IA."""
+    produtos: list[ProdutoVisionResponse]
+
+
+gemini_client = genai.Client(api_key=(GEMINI_API_KEY or '').strip()) if GEMINI_API_KEY else None
 
 
 def extract_chat_id(payload: dict) -> str | None:
@@ -93,6 +130,7 @@ async def chat_sync(request: Request):
             session_id,
             prompt_ia or None,
             bot_objective,
+            tenant_id,
         )
     except Exception as exc:
         print(f'[chat-sync] erro ao gerar resposta: {exc}')
@@ -101,7 +139,21 @@ async def chat_sync(request: Request):
             status_code=500,
         )
 
-    return {'reply': reply}
+    ai_response = (reply or '').rstrip()
+    is_sale_complete = ai_response.endswith('✅')
+
+    payload = {
+        # Compatibilidade com frontend antigo.
+        'reply': ai_response,
+        # Novo contrato para o funil de conversão.
+        'response': ai_response,
+        'sale_complete': is_sale_complete,
+        'summary': ai_response if is_sale_complete else None,
+        # Sinal opcional para efeitos visuais no frontend.
+        'confetti': is_sale_complete,
+    }
+
+    return payload
 
 
 @app.post('/webhook')
@@ -133,3 +185,197 @@ async def webhook(request: Request):
         )
 
     return {'status': 'ok'}
+
+
+@app.post('/api/produtos/import-vision')
+async def import_cardapio_vision(
+    tenant_id: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """
+    Endpoint para importar produtos a partir de uma imagem de cardápio.
+    
+    Recebe:
+    - tenant_id: ID do tenant
+    - file: Arquivo de imagem (JPG, PNG, etc.)
+    
+    Retorna:
+    - Quantidade de produtos importados
+    - Lista de produtos criados (com IDs)
+    """
+    # Validação básica
+    tenant_id = (tenant_id or '').strip()
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail='tenant_id é obrigatório.')
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail='Arquivo não fornecido.')
+
+    # Validar tipo de arquivo (imagem)
+    allowed_formats = {'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'}
+    if file.content_type not in allowed_formats:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Tipo de arquivo não suportado. Use: JPEG, PNG, GIF, WebP ou BMP.'
+        )
+
+    try:
+        # Ler conteúdo do arquivo em memória
+        file_content = await file.read()
+        if not file_content:
+            raise HTTPException(status_code=400, detail='Arquivo vazio.')
+
+        if gemini_client is None:
+            raise HTTPException(
+                status_code=500,
+                detail='GEMINI_API_KEY não configurada para importação por visão.'
+            )
+
+        # ====================================================================
+        # Chamada ao Gemini Vision com Fallback de Modelos
+        # ====================================================================
+        vision_prompt = (
+            "Você é um extrator de dados de cardápio. Leia a imagem fornecida. "
+            "Retorne EXATAMENTE um array JSON contendo os produtos. "
+            "Para cada produto, extraia: 'nome', 'preco_base' (float), 'categoria' (string) "
+            "e coloque a descrição do item dentro de 'regras_ia' (string). "
+            "Assuma 'ativo': true. "
+            "Não retorne markdown, comentários ou texto fora do JSON. "
+            "Se não houver produtos legíveis, retorne []."
+        )
+
+        # Tentar modelos em ordem de preferência (modelos vision-capable disponíveis)
+        models_to_try = ['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-2.5-pro']
+        gemini_response = None
+        last_error = None
+
+        for model_name in models_to_try:
+            try:
+                print(f'[import-vision] Tentando usar modelo: {model_name}')
+                gemini_response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        vision_prompt,
+                        types.Part.from_bytes(
+                            data=file_content,
+                            mime_type=file.content_type or 'image/jpeg',
+                        ),
+                    ],
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        response_mime_type='application/json',
+                    ),
+                )
+                print(f'[import-vision] Modelo {model_name} funcionou com sucesso.')
+                break
+            except Exception as e:
+                last_error = str(e)
+                print(f'[import-vision] Erro com modelo {model_name}: {last_error}')
+                continue
+
+        if gemini_response is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f'Falha ao processar imagem com Gemini. Último erro: {last_error}'
+            )
+
+        # Extrair conteúdo da resposta com segurança
+        answer_text = (getattr(gemini_response, 'text', None) or '').strip()
+        
+        if not answer_text:
+            print('[import-vision] Gemini retornou resposta vazia')
+            raise HTTPException(
+                status_code=500,
+                detail='A IA não conseguiu processar a imagem. Verifique a qualidade.'
+            )
+        
+        print(f'[import-vision] Resposta bruta do Gemini (primeiros 500 chars): {answer_text[:500]}')
+        
+        # Remover markdown code blocks (```json ... ```) se presentes
+        if answer_text.startswith('```json'):
+            answer_text = answer_text[len('```json'):].strip()
+        if answer_text.startswith('```'):
+            answer_text = answer_text[len('```'):].strip()
+        if answer_text.endswith('```'):
+            answer_text = answer_text[:-3].strip()
+
+        # Parsear JSON retornado
+        try:
+            parsed_data = json.loads(answer_text)
+            print(f'[import-vision] JSON parseado com sucesso. Tipo: {type(parsed_data).__name__}')
+            
+            # Se for lista direta, converter para formato esperado
+            if isinstance(parsed_data, list):
+                print(f'[import-vision] Resposta é array direto, convertendo para formato esperado.')
+                parsed_data = {'produtos': parsed_data}
+            
+            # Se for string, tentar parsear novamente
+            elif isinstance(parsed_data, str):
+                print(f'[import-vision] Resposta é string, tentando parsear novamente.')
+                parsed_data = json.loads(parsed_data)
+                if isinstance(parsed_data, list):
+                    parsed_data = {'produtos': parsed_data}
+                    
+        except json.JSONDecodeError as e:
+            print(f'[import-vision] Erro ao fazer parse do JSON da IA: {answer_text}')
+            raise HTTPException(
+                status_code=500,
+                detail=f'Falha ao processar resposta da IA: JSON inválido. {str(e)}'
+            )
+
+        # Validar com Pydantic
+        try:
+            validated = ProdutosVisionList(**parsed_data)
+        except Exception as e:
+            print(f'[import-vision] Erro ao validar schema Pydantic: {str(e)}')
+            raise HTTPException(
+                status_code=500,
+                detail=f'Resposta da IA não segue o formato esperado: {str(e)}'
+            )
+
+        # ====================================================================
+        # Salvar produtos no banco de dados
+        # ====================================================================
+        created_produtos = []
+        
+        for produto_data in validated.produtos:
+            try:
+                # Chamada async para criar produto
+                produto_id = await create_produto(
+                    tenant_id=tenant_id,
+                    nome=produto_data.nome,
+                    categoria=produto_data.categoria or 'Geral',
+                    preco_base=float(produto_data.preco_base),
+                    classe_negocio='generico',
+                    regras_ia=produto_data.regras_ia or '',
+                    config_nicho={},
+                )
+                
+                if produto_id:
+                    created_produtos.append({
+                        'id': produto_id,
+                        'nome': produto_data.nome,
+                        'preco_base': produto_data.preco_base,
+                        'categoria': produto_data.categoria,
+                    })
+            except Exception as e:
+                print(f'[import-vision] Erro ao criar produto "{produto_data.nome}": {str(e)}')
+                # Continuar com próximos produtos em caso de erro individual
+                continue
+
+        # Retornar resultado
+        return JSONResponse({
+            'sucesso': True,
+            'quantidade_importada': len(created_produtos),
+            'produtos': created_produtos,
+            'mensagem': f'{len(created_produtos)} produtos foram importados com sucesso.',
+        })
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f'[import-vision] Erro geral: {str(exc)}')
+        raise HTTPException(
+            status_code=500,
+            detail=f'Erro ao processar a imagem: {str(exc)}'
+        )

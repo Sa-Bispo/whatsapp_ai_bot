@@ -60,6 +60,40 @@ async def _fetch_stock_rows(tenant_id: str) -> list[asyncpg.Record]:
         await conn.close()
 
 
+async def fetch_active_produtos(tenant_id: str) -> list[dict[str, Any]]:
+    """Busca produtos ativos do catálogo híbrido para um tenant."""
+    if not BOT_DATABASE_CONNECTION_URI:
+        raise RuntimeError('DATABASE_CONNECTION_URI não configurada.')
+
+    normalized_tenant_id = (tenant_id or '').strip()
+    if not normalized_tenant_id:
+        raise ValueError('tenant_id é obrigatório para buscar produtos ativos.')
+
+    conn = await asyncpg.connect(BOT_DATABASE_CONNECTION_URI)
+    try:
+        rows = await conn.fetch(
+            '''
+            SELECT
+                id,
+                nome,
+                categoria,
+                preco_base,
+                classe_negocio,
+                config_nicho,
+                regras_ia
+            FROM produtos
+            WHERE tenant_id = $1
+              AND ativo = TRUE
+            ORDER BY categoria ASC, nome ASC
+            ''',
+            normalized_tenant_id,
+        )
+    finally:
+        await conn.close()
+
+    return [dict(row) for row in rows]
+
+
 async def get_tenant_configs(tenant_id: str) -> dict[str, str]:
     if not BOT_DATABASE_CONNECTION_URI:
         raise RuntimeError('DATABASE_CONNECTION_URI não configurada.')
@@ -224,6 +258,58 @@ async def _fetch_last_order_by_phone(tenant_id: str, phone: str) -> dict[str, st
         'itens_resumo': itens_resumo or 'Itens não informados',
         'criado_em': str(order_row.get('data_criacao') or ''),
     }
+
+
+async def create_produto(
+    tenant_id: str,
+    nome: str,
+    categoria: str,
+    preco_base: float,
+    classe_negocio: str = 'generico',
+    regras_ia: str | None = None,
+    config_nicho: dict | None = None,
+) -> str | None:
+    """Cria um novo produto no catálogo híbrido e retorna o ID do produto criado."""
+    if not BOT_DATABASE_CONNECTION_URI:
+        raise RuntimeError('DATABASE_CONNECTION_URI não configurada.')
+
+    normalized_tenant_id = (tenant_id or '').strip()
+    normalized_nome = (nome or '').strip()
+    normalized_categoria = (categoria or '').strip()
+    normalized_classe_negocio = (classe_negocio or 'generico').strip()
+    normalized_regras_ia = (regras_ia or '').strip() or None
+
+    if not normalized_tenant_id or not normalized_nome or not normalized_categoria:
+        raise ValueError('tenant_id, nome e categoria são obrigatórios para criar um produto.')
+
+    try:
+        preco_base_float = float(preco_base)
+    except (TypeError, ValueError):
+        raise ValueError(f'preco_base inválido: {preco_base}')
+
+    if config_nicho is None:
+        config_nicho = {}
+
+    conn = await asyncpg.connect(BOT_DATABASE_CONNECTION_URI)
+    try:
+        result = await conn.fetchval(
+            '''
+            INSERT INTO produtos
+            (tenant_id, nome, categoria, preco_base, classe_negocio, config_nicho, regras_ia, ativo)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, TRUE)
+            RETURNING id
+            ''',
+            normalized_tenant_id,
+            normalized_nome,
+            normalized_categoria,
+            preco_base_float,
+            normalized_classe_negocio,
+            config_nicho,
+            normalized_regras_ia,
+        )
+        return result
+    finally:
+        await conn.close()
 
 
 def list_estoque(tenant_id: str) -> dict[str, dict]:

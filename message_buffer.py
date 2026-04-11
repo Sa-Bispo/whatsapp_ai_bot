@@ -757,6 +757,7 @@ async def process_message(chat_id: str, user_message: str, tenant_id: str, insta
             conversation_id,
             prompt_ia,
             bot_objective,
+            tenant_id,
         )
     except Exception as error:
         log(f'Erro ao gerar resposta da IA: {error}')
