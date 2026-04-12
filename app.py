@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import uuid
 
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -337,8 +338,19 @@ async def import_cardapio_vision(
         # Salvar produtos no banco de dados
         # ====================================================================
         created_produtos = []
-        
+        extracted_produtos = []
+
         for produto_data in validated.produtos:
+            # Sempre retornar a extração para revisão no frontend,
+            # mesmo se ocorrer falha ao persistir no banco.
+            fallback_id = f'vision_{uuid.uuid4().hex[:8]}'
+            extracted_produtos.append({
+                'id': fallback_id,
+                'nome': produto_data.nome,
+                'preco_base': produto_data.preco_base,
+                'categoria': produto_data.categoria,
+            })
+
             try:
                 # Chamada async para criar produto
                 produto_id = await create_produto(
@@ -364,11 +376,12 @@ async def import_cardapio_vision(
                 continue
 
         # Retornar resultado
+        produtos_resposta = created_produtos if len(created_produtos) > 0 else extracted_produtos
         return JSONResponse({
             'sucesso': True,
-            'quantidade_importada': len(created_produtos),
-            'produtos': created_produtos,
-            'mensagem': f'{len(created_produtos)} produtos foram importados com sucesso.',
+            'quantidade_importada': len(produtos_resposta),
+            'produtos': produtos_resposta,
+            'mensagem': f'{len(produtos_resposta)} produtos extraidos com sucesso para revisao.',
         })
 
     except HTTPException:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import uuid
 from decimal import Decimal
 from typing import Any
 
@@ -88,10 +89,45 @@ async def fetch_active_produtos(tenant_id: str) -> list[dict[str, Any]]:
             ''',
             normalized_tenant_id,
         )
+
+        if rows:
+            return [dict(row) for row in rows]
+
+        # Fallback: quando o catálogo híbrido ainda não foi populado,
+        # usamos os itens ativos do estoque para manter o bot alinhado com a tela de Estoque.
+        stock_rows = await conn.fetch(
+            '''
+            SELECT
+                id,
+                nome,
+                variacao,
+                preco,
+                quantidade
+            FROM stock_items
+            WHERE tenant_id = $1
+              AND quantidade > 0
+            ORDER BY nome ASC
+            ''',
+            normalized_tenant_id,
+        )
     finally:
         await conn.close()
 
-    return [dict(row) for row in rows]
+    mapped_rows: list[dict[str, Any]] = []
+    for row in stock_rows:
+        mapped_rows.append(
+            {
+                'id': str(row.get('id')),
+                'nome': str(row.get('nome') or '').strip(),
+                'categoria': str(row.get('variacao') or BOT_ESTOQUE_DEFAULT_CATEGORY or 'Sem categoria').strip(),
+                'preco_base': _to_float(row.get('preco')),
+                'classe_negocio': 'delivery',
+                'config_nicho': {},
+                'regras_ia': 'Produto carregado automaticamente do estoque ativo.',
+            }
+        )
+
+    return mapped_rows
 
 
 async def get_tenant_configs(tenant_id: str) -> dict[str, str]:
@@ -465,12 +501,14 @@ async def save_order(
                     customer_id,
                 )
             else:
+                new_customer_id = str(uuid.uuid4())
                 inserted_customer = await conn.fetchrow(
                     '''
-                    INSERT INTO customers (telefone, nome, endereco, tenant_id)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO customers (id, telefone, nome, endereco, tenant_id)
+                    VALUES ($1, $2, $3, $4, $5)
                     RETURNING id
                     ''',
+                    new_customer_id,
                     normalized_phone,
                     customer_name,
                     customer_address,
@@ -481,10 +519,11 @@ async def save_order(
             # B) Insert do Order
             inserted_order = await conn.fetchrow(
                 '''
-                INSERT INTO orders (status, total, forma_pagamento, tenant_id, customer_id)
-                VALUES ('NOVO', $1, $2, $3, $4)
+                INSERT INTO orders (id, status, total, forma_pagamento, tenant_id, customer_id)
+                VALUES ($1, 'NOVO', $2, $3, $4, $5)
                 RETURNING id, status, data_criacao
                 ''',
+                str(uuid.uuid4()),
                 float(total),
                 payment_method,
                 normalized_tenant_id,
@@ -506,9 +545,10 @@ async def save_order(
 
                 await conn.execute(
                     '''
-                    INSERT INTO order_items (order_id, nome_produto, quantidade, preco_unitario)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO order_items (id, order_id, nome_produto, quantidade, preco_unitario)
+                    VALUES ($1, $2, $3, $4, $5)
                     ''',
+                    str(uuid.uuid4()),
                     order_id,
                     nome_produto,
                     quantidade,

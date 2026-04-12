@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from pathlib import Path
 import redis.asyncio as redis
 
@@ -380,6 +381,98 @@ async def _save_context(chat_id: str, data: dict):
 
 def _normalize_text(value: str) -> str:
     return value.strip().lower()
+
+
+def _extract_summary_field(text: str, pattern: str) -> str:
+    match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ''
+    return (match.group(1) or '').strip(' \n\t*-_')
+
+
+def _extract_order_summary_fields(reply_message: str) -> tuple[str, str, str]:
+    items = _extract_summary_field(
+        reply_message,
+        r'(?:🛒\s*\*?itens:?\*?)\s*(.+?)(?=(?:📍|\*?endere|💳|\*?pagamento|$))',
+    )
+    address = _extract_summary_field(
+        reply_message,
+        r'(?:📍\s*\*?endere[cç]o:?\*?)\s*(.+?)(?=(?:💳|\*?pagamento|$))',
+    )
+    payment = _extract_summary_field(
+        reply_message,
+        r'(?:💳\s*\*?pagamento:?\*?)\s*(.+)',
+    )
+    payment = payment.replace('✅', '').strip()
+    if '\n' in payment:
+        payment = payment.splitlines()[0].strip()
+    return items, address, payment
+
+
+def _build_cart_items_from_summary(items_text: str) -> list[dict]:
+    normalized_items = (items_text or '').strip()
+    if not normalized_items:
+        return []
+
+    quantity_match = re.match(r'^\s*(\d+)\s*[xX]\s+(.+)$', normalized_items)
+    if quantity_match:
+        quantity = int(quantity_match.group(1))
+        product_name = quantity_match.group(2).strip()
+    else:
+        quantity = 1
+        product_name = normalized_items
+
+    return [
+        {
+            'product_name': product_name,
+            'name': product_name,
+            'quantity': max(1, quantity),
+            'price': 0.0,
+        }
+    ]
+
+
+async def _persist_ai_final_order_if_needed(
+    chat_id: str,
+    tenant_id: str,
+    reply_message: str,
+) -> None:
+    normalized_reply = (reply_message or '').strip()
+    if '*Resumo do Pedido*' not in normalized_reply or not normalized_reply.endswith('✅'):
+        return
+
+    items_text, address, payment = _extract_order_summary_fields(normalized_reply)
+    if not items_text or not address or not payment:
+        log('Resumo final detectado, mas campos obrigatórios incompletos para persistência.')
+        return
+
+    context_key = _context_key(chat_id)
+    fingerprint = f'{items_text}|{address}|{payment}'.strip().lower()
+    last_fingerprint = (await redis_client.hget(context_key, 'last_order_fingerprint') or '').strip().lower()
+    if last_fingerprint and last_fingerprint == fingerprint:
+        log('Pedido final já persistido anteriormente para este chat; ignorando duplicidade.')
+        return
+
+    cart_items = _build_cart_items_from_summary(items_text)
+    if not cart_items:
+        return
+
+    total = sum(float(item.get('price') or 0) * int(item.get('quantity') or 0) for item in cart_items)
+
+    try:
+        await save_order(
+            tenant_id=tenant_id,
+            phone=chat_id,
+            nome='Cliente WhatsApp',
+            endereco=address,
+            cart_items=cart_items,
+            total=total,
+            forma_pagamento=payment,
+        )
+        await redis_client.hset(context_key, mapping={'last_order_fingerprint': fingerprint})
+        log(f'Pedido persistido no Kanban para {tenant_id}:{chat_id}')
+    except Exception as error:
+        log(f'Falha ao persistir pedido no Kanban: {error}')
 
 
 async def _load_grouped_products(tenant_id: str) -> dict[str, dict]:
@@ -821,6 +914,11 @@ async def handle_debounce(chat_id: str, tenant_id: str, instance_name: str):
                     instance_name=instance_name,
                 )
                 log(f'Resposta enviada para {chat_id}')
+                await _persist_ai_final_order_if_needed(
+                    chat_id=chat_id,
+                    tenant_id=tenant_id,
+                    reply_message=reply_message,
+                )
             except Exception as error:
                 log(f'Falha ao enviar mensagem para {chat_id}: {error}')
         await redis_client.delete(buffer_key)
