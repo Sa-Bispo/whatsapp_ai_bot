@@ -13,6 +13,9 @@ services:
     depends_on:
       - postgres
       - redis
+    networks:
+      - default
+      - saas_network
 
   postgres:
     container_name: postgres
@@ -27,6 +30,8 @@ services:
       - postgres_data:/var/lib/postgresql/data
     expose:
       - 5432
+    networks:
+      - default
 
   redis:
     image: redis:latest
@@ -37,6 +42,8 @@ services:
       - redis:/data
     ports:
       - 6379:6379
+    networks:
+      - default
 
   bot:
     build: .
@@ -52,6 +59,9 @@ services:
     volumes:
       - ./vectorstore_data:/app/vectorstore
       - ./rag_files:/app/rag_files
+    networks:
+      - default
+      - saas_network
 
 volumes:
   evolution_instances:
@@ -59,3 +69,8 @@ volumes:
   redis:
   vectorstore_data:
   rag_files:
+
+networks:
+  default:
+  saas_network:
+    external: true
