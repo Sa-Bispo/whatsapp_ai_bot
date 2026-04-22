@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
 import uuid
 from decimal import Decimal
@@ -12,6 +14,9 @@ from config import (
     BOT_ESTOQUE_DEFAULT_CATEGORY,
     BOT_DATABASE_CONNECTION_URI,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_TENANT_PROMPT = (
@@ -69,6 +74,11 @@ async def fetch_active_produtos(tenant_id: str) -> list[dict[str, Any]]:
     normalized_tenant_id = (tenant_id or '').strip()
     if not normalized_tenant_id:
         raise ValueError('tenant_id é obrigatório para buscar produtos ativos.')
+
+    # Test mode: pizzaria/adega/lanchonete sem produtos reais
+    if normalized_tenant_id in ['pizzaria', 'adega', 'lanchonete']:
+        logger.warning(f"[FALLBACK] fetch_active_produtos em test mode para {normalized_tenant_id}")
+        return []
 
     conn = await asyncpg.connect(BOT_DATABASE_CONNECTION_URI)
     try:
@@ -130,7 +140,7 @@ async def fetch_active_produtos(tenant_id: str) -> list[dict[str, Any]]:
     return mapped_rows
 
 
-async def get_tenant_configs(tenant_id: str) -> dict[str, str]:
+async def get_tenant_configs(tenant_id: str) -> dict[str, Any]:
     if not BOT_DATABASE_CONNECTION_URI:
         raise RuntimeError('DATABASE_CONNECTION_URI não configurada.')
 
@@ -139,35 +149,99 @@ async def get_tenant_configs(tenant_id: str) -> dict[str, str]:
         raise ValueError('tenant_id é obrigatório para carregar configurações.')
 
     conn = await asyncpg.connect(BOT_DATABASE_CONNECTION_URI)
+    
+    row = None
     try:
         row = await conn.fetchrow(
             '''
             SELECT
                 "promptIa" AS prompt_ia,
                 "whatsappAdmin" AS whatsapp_admin,
-                "botObjective" AS bot_objective
+                "botObjective" AS bot_objective,
+                "companyName" AS nome_negocio,
+                "botName" AS nome_atendente,
+                config_nicho
             FROM tenants
             WHERE id = $1
             LIMIT 1
             ''',
             normalized_tenant_id,
         )
+    except Exception as e:
+        # Fallback: se não conseguir fazer query (UUID inválido), tentar com sub_nicho
+        if normalized_tenant_id in ['pizzaria', 'adega', 'lanchonete']:
+            logger.warning(f"[FALLBACK] tenant_id '{normalized_tenant_id}' não é UUID, usando como test mode")
+        else:
+            raise
     finally:
         await conn.close()
 
     prompt_ia = ''
     whatsapp_admin = ''
     bot_objective = ''
+    nome_negocio = ''
+    nome_atendente = ''
+    config_nicho: dict[str, Any] = {}
 
+    tenant: dict[str, Any] = {}
     if row:
+        tenant = dict(row)
         prompt_ia = str(row.get('prompt_ia') or '').strip()
         whatsapp_admin = str(row.get('whatsapp_admin') or '').strip()
         bot_objective = str(row.get('bot_objective') or '').strip().upper()
+        nome_negocio = str(row.get('nome_negocio') or '').strip()
+        nome_atendente = str(row.get('nome_atendente') or '').strip()
+
+        raw_cfg = row.get('config_nicho')
+        if isinstance(raw_cfg, str):
+            try:
+                parsed_cfg = json.loads(raw_cfg)
+                if isinstance(parsed_cfg, dict):
+                    config_nicho = parsed_cfg
+            except Exception as e:
+                logger.error(f"[TENANT] Failed to parse JSON config_nicho: {e}")
+                config_nicho = {}
+        elif isinstance(raw_cfg, dict):
+            config_nicho = raw_cfg
+
+    # Fallback: se row for None (test mode com pizzaria/adega/lanchonete), usar sub_nicho como config
+    if not row and normalized_tenant_id in ['pizzaria', 'adega', 'lanchonete']:
+        nome_negocio = f'{normalized_tenant_id.title()}'
+        config_nicho = {
+            'sub_nicho': normalized_tenant_id,
+            'faz_delivery': True,
+            'horarios': [],
+        }
+        prompt_ia = ''  # Usará fallback de TEST_DRIVE_SUB_NICHO_RULES
+        bot_objective = 'FECHAR_PEDIDO'
+
+    sub_nicho = str(config_nicho.get('sub_nicho') or config_nicho.get('subNicho') or '').strip().lower()
+    horarios = config_nicho.get('horarios')
+    if not isinstance(horarios, list):
+        horarios = []
+
+    faz_delivery = bool(
+        config_nicho.get('faz_delivery')
+        or config_nicho.get('delivery')
+        or config_nicho.get('accept_delivery')
+    )
+    faz_retirada = bool(
+        config_nicho.get('faz_retirada')
+        or config_nicho.get('retirada')
+        or config_nicho.get('accept_pickup')
+    )
 
     return {
         'promptIa': prompt_ia or DEFAULT_TENANT_PROMPT,
         'whatsappAdmin': whatsapp_admin,
         'botObjective': bot_objective or 'FECHAR_PEDIDO',
+        'nome_negocio': nome_negocio or 'nossa loja',
+        'nome_atendente': nome_atendente or (nome_negocio.split()[0] if nome_negocio else 'Atendente'),
+        'sub_nicho': sub_nicho or 'adega',
+        'horarios': horarios,
+        'faz_delivery': faz_delivery,
+        'faz_retirada': faz_retirada,
+        'config_nicho': config_nicho,
     }
 
 
@@ -346,6 +420,282 @@ async def create_produto(
         return result
     finally:
         await conn.close()
+
+
+async def fetch_stock_for_context(tenant_id: str) -> dict:
+    """
+    Retorna dados de cardápio para montar o contexto do bot por sub-nicho.
+
+    Formato de retorno:
+    {
+      "sub_nicho": str,
+      "items": [{"nome": str, "preco": float, "quantidade": int, "disponivel": bool}],
+      "combos": [{"nome": str, "descricao": str, "preco": float, "disponivel": bool}],
+      "sabores": [{"nome": str, "categoria": str, "disponivel": bool, "precos": {"P": 35.0}}],
+      "tamanhos": [{"sigla": str, "nome": str, "fatias": int, "modificador_preco": float}],
+      "bordas": [{"nome": str, "preco_extra": float}],
+    }
+    """
+    if not BOT_DATABASE_CONNECTION_URI:
+        raise RuntimeError('DATABASE_CONNECTION_URI não configurada.')
+
+    conn = await asyncpg.connect(BOT_DATABASE_CONNECTION_URI)
+    try:
+        tenant_row = await conn.fetchrow(
+            'SELECT config_nicho FROM tenants WHERE id = $1 LIMIT 1',
+            tenant_id,
+        )
+
+        sub_nicho = None
+        if tenant_row:
+            raw_cfg = tenant_row['config_nicho']
+            if isinstance(raw_cfg, str):
+                try:
+                    cfg = json.loads(raw_cfg)
+                except Exception:
+                    cfg = {}
+            elif isinstance(raw_cfg, dict):
+                cfg = raw_cfg
+            else:
+                cfg = {}
+
+            if isinstance(cfg, dict):
+                sub_nicho = cfg.get('sub_nicho') or cfg.get('subNicho')
+        
+        logger.info(f"[FETCH-STOCK] tenant_id: {tenant_id} | sub_nicho: {sub_nicho}")
+
+        if sub_nicho == 'pizzaria':
+            logger.info(f"[FETCH-STOCK] Iniciando queries para pizzaria...")
+            try:
+                # Fazer as queries sequencialmente, não em paralelo
+                sabor_rows = await conn.fetch(
+                    '''
+                    SELECT nome, variacao, preco, ativo
+                    FROM stock_items
+                    WHERE tenant_id = $1
+                      AND ativo = TRUE
+                    ORDER BY nome ASC
+                    ''',
+                    tenant_id,
+                )
+                logger.info(f"[FETCH-STOCK] Sabores retornados: {len(sabor_rows)}")
+                
+                tamanho_rows = await conn.fetch(
+                    '''
+                    SELECT sigla, nome, fatias, modificador_preco
+                    FROM pizza_tamanhos
+                    WHERE tenant_id = $1
+                    ORDER BY ordem ASC, created_at ASC
+                    ''',
+                    tenant_id,
+                )
+                logger.info(f"[FETCH-STOCK] Tamanhos retornados: {len(tamanho_rows)}")
+                
+                borda_rows = await conn.fetch(
+                    '''
+                    SELECT nome, preco_extra
+                    FROM pizza_bordas
+                    WHERE tenant_id = $1
+                    ORDER BY created_at ASC
+                    ''',
+                    tenant_id,
+                )
+                logger.info(f"[FETCH-STOCK] Bordas retornadas: {len(borda_rows)}")
+                
+            except Exception as e:
+                logger.error(f"[FETCH-STOCK] Erro nas queries: {e}", exc_info=True)
+                raise
+
+            tamanhos: list[dict[str, Any]] = []
+            for row in tamanho_rows:
+                tamanhos.append(
+                    {
+                        'sigla': str(row.get('sigla') or '').strip(),
+                        'nome': str(row.get('nome') or '').strip(),
+                        'fatias': int(row.get('fatias') or 0),
+                        'modificador_preco': _to_float(row.get('modificador_preco') or 0),
+                    }
+                )
+
+            sabores: list[dict[str, Any]] = []
+            for row in sabor_rows:
+                base = _to_float(row.get('preco') or 0)
+                precos: dict[str, float] = {}
+                for tamanho in tamanhos:
+                    sigla = str(tamanho.get('sigla') or '').strip()
+                    if not sigla:
+                        continue
+                    precos[sigla] = base + float(tamanho.get('modificador_preco') or 0)
+
+                sabores.append(
+                    {
+                        'nome': str(row.get('nome') or '').strip(),
+                        'categoria': str(row.get('variacao') or 'Outros').strip(),
+                        'disponivel': bool(row.get('ativo')),
+                        'precos': precos,
+                    }
+                )
+
+            bordas: list[dict[str, Any]] = []
+            for row in borda_rows:
+                bordas.append(
+                    {
+                        'nome': str(row.get('nome') or '').strip(),
+                        'preco_extra': _to_float(row.get('preco_extra') or 0),
+                    }
+                )
+
+            logger.info(f"[FETCH-STOCK-PIZZA] Retornando: {len(sabores)} sabores, {len(tamanhos)} tamanhos, {len(bordas)} bordas")
+            
+            return {
+                'sub_nicho': 'pizzaria',
+                'sabores': sabores,
+                'tamanhos': tamanhos,
+                'bordas': bordas,
+            }
+
+        item_rows = await conn.fetch(
+            '''
+            SELECT nome, preco, quantidade
+            FROM stock_items
+            WHERE tenant_id = $1
+            ORDER BY nome ASC
+            ''',
+            tenant_id,
+        )
+
+        combo_rows = []
+        if sub_nicho == 'lanchonete':
+            combo_rows = await conn.fetch(
+                '''
+                SELECT nome, descricao, preco, ativo
+                FROM combos
+                WHERE tenant_id = $1
+                  AND ativo = TRUE
+                ORDER BY nome ASC
+                ''',
+                tenant_id,
+            )
+        else:
+            combo_rows = await conn.fetch(
+                '''
+                SELECT nome, preco_base, config_nicho
+                FROM produtos
+                WHERE tenant_id = $1
+                  AND ativo = TRUE
+                  AND classe_negocio = \'combo\'
+                ORDER BY nome ASC
+                ''',
+                tenant_id,
+            )
+    finally:
+        await conn.close()
+
+    import json as _json
+
+    stock_map: dict[str, int] = {}
+    items: list[dict] = []
+    for row in item_rows:
+        nome = str(row['nome'] or '').strip()
+        qty = int(row['quantidade'] or 0)
+        stock_map[nome.lower()] = qty
+        items.append({
+            'nome': nome,
+            'preco': _to_float(row['preco']),
+            'quantidade': qty,
+            'disponivel': qty > 0,
+        })
+
+    combos: list[dict] = []
+    for row in combo_rows:
+        nome = str(row['nome'] or '').strip()
+
+        if 'preco' in row.keys():
+            combos.append(
+                {
+                    'nome': nome,
+                    'descricao': str(row.get('descricao') or '').strip(),
+                    'preco': _to_float(row.get('preco') or 0),
+                    'disponivel': bool(row.get('ativo')),
+                }
+            )
+            continue
+
+        raw_cfg = row['config_nicho']
+        if isinstance(raw_cfg, str):
+            try:
+                cfg = _json.loads(raw_cfg)
+            except Exception:
+                cfg = {}
+        elif isinstance(raw_cfg, dict):
+            cfg = raw_cfg
+        else:
+            cfg = {}
+
+        componentes: list[str] = cfg.get('componentes', []) if isinstance(cfg, dict) else []
+        disponivel = (
+            all(stock_map.get(c.lower(), 0) > 0 for c in componentes)
+            if componentes
+            else True
+        )
+        descricao = cfg.get('descricao', ' + '.join(componentes)) if isinstance(cfg, dict) else ' + '.join(componentes)
+        combos.append({
+            'nome': nome,
+            'descricao': descricao,
+            'preco': _to_float(row['preco_base']),
+            'disponivel': disponivel,
+        })
+
+    return {'sub_nicho': sub_nicho or 'adega', 'items': items, 'combos': combos}
+
+
+async def get_tenant_sub_nicho(tenant_id: str) -> str | None:
+    """Retorna o sub_nicho do tenant (ex: 'adega', 'pizzaria') ou None."""
+    if not BOT_DATABASE_CONNECTION_URI:
+        raise RuntimeError('DATABASE_CONNECTION_URI não configurada.')
+
+    normalized_tenant_id = (tenant_id or '').strip()
+    
+    # Test mode: return sub_nicho directly if it's a known niche name
+    if normalized_tenant_id in ['pizzaria', 'adega', 'lanchonete']:
+        return normalized_tenant_id
+
+    conn = await asyncpg.connect(BOT_DATABASE_CONNECTION_URI)
+    try:
+        row = await conn.fetchrow(
+            'SELECT config_nicho FROM tenants WHERE id = $1 LIMIT 1',
+            normalized_tenant_id,
+        )
+    except Exception:
+        # If query fails due to invalid UUID, return None (no specific sub_nicho)
+        return None
+    finally:
+        await conn.close()
+
+    if not row:
+        return None
+
+    import json as _json
+
+    raw_cfg = row['config_nicho']
+    if isinstance(raw_cfg, str):
+        try:
+            cfg = _json.loads(raw_cfg)
+        except Exception:
+            return None
+    elif isinstance(raw_cfg, dict):
+        cfg = raw_cfg
+    else:
+        return None
+
+    if not isinstance(cfg, dict):
+        return None
+
+    value = cfg.get('sub_nicho') or cfg.get('subNicho')
+    if isinstance(value, str):
+        return value
+
+    return None
 
 
 def list_estoque(tenant_id: str) -> dict[str, dict]:
@@ -578,3 +928,52 @@ async def save_order(
         'forma_pagamento': payment_method,
         'status': str(inserted_order.get('status') or 'NOVO'),
     }
+
+
+async def save_pizza_order(tenant_id: str, phone: str, session: dict[str, Any]) -> dict[str, Any] | None:
+    """Persiste pedido finalizado do fluxo de pizzaria no mesmo pipeline de pedidos padrão."""
+    sabor = str(session.get('sabor') or session.get('sabor_sugerido') or '').strip()
+    tamanho = str(session.get('tamanho') or '').strip().upper()
+    tamanho_display = str(session.get('tamanho_display') or tamanho).strip()
+    borda = str(session.get('borda') or 'Sem borda').strip()
+    endereco = str(session.get('endereco') or '').strip()
+    pagamento = str(session.get('pagamento') or '').strip()
+
+    if not sabor or not endereco or not pagamento:
+        return None
+
+    quantidade = int(session.get('quantidade') or 1)
+    if quantidade <= 0:
+        quantidade = 1
+
+    try:
+        total = float(session.get('total') or 0)
+    except (TypeError, ValueError):
+        total = 0.0
+
+    # O fluxo calcula total já com quantidade; salvar item com preço unitário.
+    preco_unitario = total / quantidade if quantidade > 0 else total
+
+    tamanho_texto = tamanho_display or tamanho
+    item_nome = f'{sabor} {tamanho_texto}'.strip()
+    if borda and borda.lower() != 'sem borda':
+        item_nome = f'{item_nome} + {borda}'
+
+    cart_items = [
+        {
+            'product_name': item_nome,
+            'name': item_nome,
+            'quantity': quantidade,
+            'price': preco_unitario,
+        }
+    ]
+
+    return await save_order(
+        tenant_id=tenant_id,
+        phone=phone,
+        nome='Cliente WhatsApp',
+        endereco=endereco,
+        cart_items=cart_items,
+        total=total,
+        forma_pagamento=pagamento,
+    )
