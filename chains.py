@@ -1539,7 +1539,7 @@ def generate_persona_response(
                     ),
                 )
                 try:
-                    response = future.result(timeout=10.0)
+                    response = future.result(timeout=8.0)
                     logger.info('[GEMINI] Modelo usado: %s', candidate_model)
                     break
                 except concurrent.futures.TimeoutError:
@@ -1556,7 +1556,10 @@ def generate_persona_response(
                 if last_error is not None:
                     raise last_error
                 logger.error('[GEMINI] Timeout na chamada — retornando fallback')
-                fallback = 'Desculpa, tive um problema técnico. Pode repetir o pedido?'
+                fallback = (
+                    'Desculpa a demora! Pode continuar com seu pedido? 😊 '
+                    'Me fala se quer mais alguma coisa ou pode fechar!'
+                )
                 history.add_user_message(user_message)
                 history.add_ai_message(fallback)
                 return fallback

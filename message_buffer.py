@@ -1,8 +1,6 @@
 import asyncio
+import importlib
 import json
-import logging
-import re
-import time
 from pathlib import Path
 import redis.asyncio as redis
 
@@ -13,53 +11,90 @@ from config import (
     BUFFER_KEY_SUFIX,
     DEBOUNCE_SECONDS,
     BUFFER_TTL,
+    ADMIN_WHATSAPP_NUMBER,
 )
 from evolution_api import send_whatsapp_message, send_whatsapp_presence
 try:
     from evolution_api import send_whatsapp_image_file, send_whatsapp_media
 except ImportError:
-    def send_whatsapp_image_file(number, file_path, caption=''):
+    def send_whatsapp_image_file(number, file_path, caption='', instance_name=None):
         return None
 
-    def send_whatsapp_media(number, caption, media_url):
+    def send_whatsapp_media(number, caption, media_url, mediatype='image', file_name=None, mimetype=None, instance_name=None):
         return None
 from database_api import (
-    get_tenant_configs,
     get_cliente_by_phone,
     get_ultimo_pedido,
     list_estoque,
     save_order,
-    save_pizza_order,
-    fetch_stock_for_context,
 )
-from chains import generate_persona_response
-from memory import clear_session_history, get_session_history
-from order_extractor import (
-    build_structured_order_payload,
-    build_order_payload_from_history_window,
-    build_order_payload_from_history_window_async,
-)
-from pizza_flow import process_pizza_message, PizzaState
-from adega_flow import process_adega_message, AdegaState, save_adega_order_payload
-from lanchonete_flow import process_lanchonete_message, LanchoneteState, save_lanchonete_order_payload
-from router import detect_intent, is_within_hours
-from script_responses import (
-    resposta_saudacao,
-    resposta_horario,
-    resposta_fora_horario,
-    resposta_entrega,
-    resposta_status_pedido,
-    resposta_cardapio,
-    resposta_cancelamento_confirmacao,
-)
+from chains import generate_persona_response, invoke_rag_chain
+try:
+    _gemini_parser = importlib.import_module('gemini_parser')
+    analyze_message = _gemini_parser.analyze_message
+    extract_order_intent = _gemini_parser.extract_order_intent
+except ImportError:
+    async def analyze_message(user_message: str, cart_items: list[dict], parser_catalog: list[dict]) -> dict:
+        normalized = (user_message or '').strip().lower()
+
+        if any(token in normalized for token in {'atendente', 'humano', 'pessoa real', 'falar com alguem', 'falar com alguém'}):
+            return {'intencao': 'atendimento_humano'}
+
+        if any(token in normalized for token in {'carrinho', 'ver pedido', 'meu pedido'}):
+            return {'intencao': 'ver_carrinho'}
+
+        if any(token in normalized for token in {'finalizar', 'fechar pedido', 'concluir pedido', 'checkout'}):
+            return {'intencao': 'checkout'}
+
+        if any(token in normalized for token in {'duvida', 'dúvida', 'como', 'diferença', 'serve', 'funciona'}) and any(
+            token in normalized for token in {'whey', 'creatina', 'bcaa', 'glutamina', 'pre treino', 'pré treino'}
+        ):
+            return {'intencao': 'duvida_tecnica'}
+
+        tokens = normalized.replace(',', ' ').split()
+        qty = 1
+        for token in tokens:
+            if token.isdigit():
+                qty = max(1, int(token))
+                break
+
+        for product in parser_catalog or []:
+            code = str(product.get('codigo_pai') or '').strip().lower()
+            name = str(product.get('nome_produto') or '').strip().lower()
+            variations = product.get('variacoes') or []
+            variation = str(variations[0] if variations else 'Unico')
+
+            code_match = code and any(token == code for token in tokens)
+            name_match = name and name in normalized
+            if not code_match and not name_match:
+                continue
+
+            return {
+                'intencao': 'adicionar_carrinho',
+                'status_item': 'completo',
+                'dados_faltantes': [],
+                'upsell_sugerido': None,
+                'produto_identificado': {
+                    'codigo_pai': code,
+                    'variacao': variation,
+                    'quantidade': qty,
+                },
+            }
+
+        return {'intencao': ''}
+
+    def extract_order_intent(*args, **kwargs):
+        return {}
 
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 debounce_tasks = defaultdict(asyncio.Task)
-logger = logging.getLogger(__name__)
 
 FLOW_STATE_SUFFIX = '_flow_state'
 FLOW_CONTEXT_SUFFIX = '_flow_context'
+FLOW_TENANT_SUFFIX = '_flow_tenant'
+FLOW_INSTANCE_SUFFIX = '_flow_instance'
+FLOW_CONTEXT_TTL = 60 * 60 * 24
 
 STATE_VERIFICACAO_INICIAL = 'VERIFICACAO_INICIAL'
 STATE_MENU_INICIAL = 'MENU_INICIAL'
@@ -67,6 +102,13 @@ STATE_DUVIDAS_SUPLEMENTOS = 'DUVIDAS_SUPLEMENTOS'
 STATE_CATALOGO = 'CATALOGO'
 STATE_ESCOLHENDO_CATEGORIA = 'ESCOLHENDO_CATEGORIA'
 STATE_ADICIONANDO_CARRINHO = 'ADICIONANDO_CARRINHO'
+STATE_AGUARDANDO_VARIACAO = 'AGUARDANDO_VARIACAO'
+STATE_SUGERINDO_UPSELL = 'SUGERINDO_UPSELL'
+STATE_CHECKOUT_NOME = 'CHECKOUT_NOME'
+STATE_CHECKOUT_ENDERECO = 'CHECKOUT_ENDERECO'
+STATE_CHECKOUT_PAGAMENTO = 'CHECKOUT_PAGAMENTO'
+STATE_FINALIZACAO_CONFIRMACAO = 'FINALIZACAO_CONFIRMACAO'
+STATE_ATENDIMENTO_HUMANO = 'ATENDIMENTO_HUMANO'
 
 UPSELL_CODE = 'coq-01'
 WELCOME_IMAGE_PATH = Path(__file__).resolve().parent / 'image' / 'image.png'
@@ -89,6 +131,24 @@ def _state_key(chat_id: str) -> str:
 
 def _context_key(chat_id: str) -> str:
     return f'{chat_id}{FLOW_CONTEXT_SUFFIX}'
+
+
+def _tenant_key(chat_id: str) -> str:
+    return f'{chat_id}{FLOW_TENANT_SUFFIX}'
+
+
+def _instance_key(chat_id: str) -> str:
+    return f'{chat_id}{FLOW_INSTANCE_SUFFIX}'
+
+
+def get_main_menu_text() -> str:
+    return (
+        'Como posso te ajudar a focar no treino hoje? (Digite o número da opção desejada):\n\n'
+        '1️⃣ *Fazer um pedido / Ver Catálogo* 🛒\n'
+        '2️⃣ *Dúvidas sobre suplementos (Whey, Creatina, Pré-treino...)* 🤔\n'
+        '3️⃣ *Status do meu pedido* 📦\n'
+        '4️⃣ *Falar com um atendente (humano)* 👤'
+    )
 
 
 def get_store_info_text() -> str:
@@ -122,6 +182,19 @@ def get_catalog_text(grouped_products: dict[str, dict]) -> str:
     lines.append(QUICK_COMMANDS_TEXT)
 
     return '\n'.join(lines)
+
+
+def get_category_menu_text() -> str:
+    return (
+        'Aqui na Bora Treinar, temos as melhores marcas para o seu objetivo. '
+        'Selecione a categoria que você está procurando (Digite o número):\n\n'
+        '1️⃣ Proteínas (Whey Concentrado, Isolado, Misto, Albumina) 🥩\n'
+        '2️⃣ Aminoácidos (Creatina, BCAA, Glutamina) ⚡\n'
+        '3️⃣ Pré-treinos e Emagrecedores (Termogênicos, Energia) 🔥\n'
+        '4️⃣ Vitaminas e Saúde (Multivitamínicos, Ômega 3) 💊\n'
+        '5️⃣ Combos Promocionais (O melhor custo-benefício!) 🎁\n\n'
+        '0️⃣ Voltar ao menu inicial'
+    )
 
 
 def _with_quick_commands(text: str) -> str:
@@ -234,6 +307,59 @@ def _extract_numeric_choice(value: str) -> int | None:
         return None
 
 
+def _extract_category_choice(value: str) -> int | None:
+    numeric_choice = _extract_numeric_choice(value)
+    if numeric_choice in {0, 1, 2, 3, 4, 5}:
+        return numeric_choice
+
+    normalized = _normalize_text(value)
+    if not normalized:
+        return None
+
+    if any(token in normalized for token in {'voltar', 'menu inicial', 'inicio', 'início'}):
+        return 0
+    if any(token in normalized for token in {'proteina', 'proteínas', 'whey', 'wey', 'albumina'}):
+        return 1
+    if any(token in normalized for token in {'amino', 'creatina', 'bcaa', 'glutamina'}):
+        return 2
+    if any(token in normalized for token in {'pre treino', 'pré treino', 'termogenico', 'termogênico', 'emagrecedor'}):
+        return 3
+    if any(token in normalized for token in {'vitamina', 'multivitaminico', 'multivitamínico', 'omega', 'ômega'}):
+        return 4
+    if any(token in normalized for token in {'combo', 'promocional', 'kit', 'coqueteleira'}):
+        return 5
+
+    return None
+
+
+def _extract_menu_choice(value: str) -> int | None:
+    numeric_choice = _extract_numeric_choice(value)
+    if numeric_choice in {1, 2, 3, 4}:
+        return numeric_choice
+
+    normalized = _normalize_text(value)
+    if not normalized:
+        return None
+
+    if 'pedido' in normalized or 'catalogo' in normalized or 'catálogo' in normalized:
+        return 1
+    if (
+        'duvida' in normalized
+        or 'dúvida' in normalized
+        or 'suplemento' in normalized
+        or 'whey' in normalized
+        or 'creatina' in normalized
+        or 'bcaa' in normalized
+    ):
+        return 2
+    if 'status' in normalized:
+        return 3
+    if 'atendente' in normalized or 'humano' in normalized:
+        return 4
+
+    return None
+
+
 def _parse_yes_no(value: str) -> str | None:
     normalized = _first_token(value)
     if normalized in {'sim', 's'}:
@@ -257,122 +383,38 @@ def _payment_label(choice: str) -> str | None:
     return mapping.get(choice.strip())
 
 
-def _normalize_lookup(value: str) -> str:
-    return re.sub(r'[^a-z0-9]+', ' ', (value or '').lower()).strip()
-
-
-def _build_price_lookup_from_grouped_products(grouped_products: dict[str, dict]) -> dict[str, float]:
-    lookup: dict[str, float] = {}
-    for category in grouped_products.values():
-        for product in category.get('produtos', {}).values():
-            product_name = str(product.get('nome_produto') or '').strip()
-            if not product_name:
-                continue
-
-            variations = product.get('variacoes') or []
-            min_price: float | None = None
-            for variation in variations:
-                try:
-                    value = float(variation.get('preco') or 0)
-                except (TypeError, ValueError):
-                    continue
-                if value <= 0:
-                    continue
-                if min_price is None or value < min_price:
-                    min_price = value
-
-            if min_price is not None:
-                lookup[_normalize_lookup(product_name)] = float(min_price)
-    return lookup
-
-
-def _resolve_item_price_with_fallback(
-    item: dict,
-    price_lookup: dict[str, float],
-) -> float:
-    try:
-        price = float(item.get('price') or 0)
-    except (TypeError, ValueError):
-        price = 0.0
-
-    if price > 0:
-        return price
-
-    base_name = str(item.get('base_product_name') or '').strip()
-    product_name = str(item.get('product_name') or item.get('name') or '').strip()
-    normalized_candidates = [
-        _normalize_lookup(base_name),
-        _normalize_lookup(product_name),
-    ]
-
-    for candidate in normalized_candidates:
-        if candidate and candidate in price_lookup:
-            return float(price_lookup[candidate])
-
-    return 0.0
-
-
-def build_cart_summary(
-    cart_items: list[dict],
-    grouped_products: dict[str, dict] | None = None,
-) -> tuple[str, float]:
+def build_cart_summary(cart_items: list[dict]) -> tuple[str, float]:
     if not cart_items:
         return 'Carrinho vazio.', 0.0
 
     lines = []
     total = 0.0
-    price_lookup = _build_price_lookup_from_grouped_products(grouped_products or {})
 
-    for item in cart_items:
-        price = _resolve_item_price_with_fallback(item, price_lookup)
+    for index, item in enumerate(cart_items, start=1):
+        price = float(item.get('price', 0))
         quantity = int(item.get('quantity', 0))
         line_total = price * quantity
         total += line_total
 
         product_name = item.get('product_name') or item.get('name') or 'Produto'
-        variation_name = item.get('variation') or item.get('size') or ''
-        display_name = f'{product_name} {variation_name}'.strip()
+        variation_name = item.get('variation') or 'Unico'
 
-        lines.append(f'• {quantity}x {display_name} — {format_brl(line_total)}')
+        lines.append(
+            f"{index}) Produto: {product_name} | Variacao: {variation_name} | "
+            f"Qtd: {quantity} | Preco: {format_brl(price)} | Total: {format_brl(line_total)}"
+        )
 
     return '\n'.join(lines), total
 
 
-def build_checkout_summary(
-    cart_items: list[dict],
-    address: str,
-    payment_method: str,
-    nome_negocio: str = 'nossa loja',
-    tenant_id: str | None = None,
-) -> tuple[str | None, float]:
-    grouped_products: dict[str, dict] = {}
-    normalized_tenant_id = (tenant_id or '').strip()
-    if normalized_tenant_id:
-        try:
-            grouped_products = list_estoque(normalized_tenant_id)
-        except Exception as error:
-            log(f'Falha no fallback de preço do estoque: {error}')
-
-    items_text, total = build_cart_summary(cart_items, grouped_products=grouped_products)
-    normalized_address = (address or '').strip()
-    normalized_payment = (payment_method or '').strip()
-
-    if _cart_items_are_invalid(cart_items):
-        logger.warning('[ORDER] build_checkout_summary recebeu cart_items inválidos; não montando resumo final')
-        return None, total
-
-    endereco_ok = bool(normalized_address and '[' not in normalized_address and len(normalized_address) > 5)
-    pagamento_ok = bool(normalized_payment and '[' not in normalized_payment and len(normalized_payment) > 2)
-    if not endereco_ok or not pagamento_ok:
-        return None, total
-
+def build_checkout_summary(cart_items: list[dict], address: str, payment_method: str) -> tuple[str, float]:
+    items_text, total = build_cart_summary(cart_items)
     text = (
-        '✅ *Pedido anotado!*\n\n'
-        f'{items_text}\n'
-        f'💰 *Total: {format_brl(total)}*\n\n'
-        f'📍 {normalized_address}\n'
-        f'💳 {normalized_payment}\n\n'
-        'Tô separando já! Em breve saiu 🚀'
+        f'🛒 *Resumo Final*\n'
+        f'{items_text}\n\n'
+        f'Total: *{format_brl(total)}*\n'
+        f'Endereco: {address}\n'
+        f'Pagamento: {payment_method}'
     )
     return text, total
 
@@ -402,402 +444,93 @@ async def _save_context(chat_id: str, data: dict):
     await redis_client.hset(_context_key(chat_id), mapping=data)
 
 
+async def _save_chat_runtime_context(chat_id: str, tenant_id: str | None = None, instance_name: str | None = None):
+    if tenant_id:
+        await redis_client.set(_tenant_key(chat_id), tenant_id, ex=FLOW_CONTEXT_TTL)
+    if instance_name:
+        await redis_client.set(_instance_key(chat_id), instance_name, ex=FLOW_CONTEXT_TTL)
+
+
+async def _get_tenant_id(chat_id: str) -> str:
+    tenant_id = await redis_client.get(_tenant_key(chat_id))
+    return (tenant_id or '').strip()
+
+
+async def _get_instance_name(chat_id: str) -> str | None:
+    instance_name = await redis_client.get(_instance_key(chat_id))
+    instance_name = (instance_name or '').strip()
+    return instance_name or None
+
+
+async def _send_message(chat_id: str, text: str):
+    instance_name = await _get_instance_name(chat_id)
+    await asyncio.to_thread(
+        send_whatsapp_message,
+        chat_id,
+        text,
+        instance_name,
+    )
+
+
+async def _send_message_sequence(chat_id: str, messages: list[str]):
+    for idx, msg in enumerate(messages):
+        text = str(msg or '').strip()
+        if not text:
+            continue
+        if idx > 0:
+            await asyncio.sleep(1.5)
+        try:
+            await _send_message(chat_id, text)
+        except Exception as error:
+            log(f'[SEND] Falha ao enviar mensagem {idx + 1} para {chat_id}: {error}')
+            continue
+
+
+async def _send_presence(chat_id: str, presence: str = 'composing', delay: int = 300):
+    instance_name = await _get_instance_name(chat_id)
+    await asyncio.to_thread(
+        send_whatsapp_presence,
+        chat_id,
+        presence,
+        delay,
+        instance_name,
+    )
+
+
+async def _send_image(chat_id: str, file_path: str, caption: str = ''):
+    instance_name = await _get_instance_name(chat_id)
+    await asyncio.to_thread(
+        send_whatsapp_image_file,
+        chat_id,
+        file_path,
+        caption,
+        instance_name,
+    )
+
+
+async def _send_media(chat_id: str, caption: str, media_url: str):
+    instance_name = await _get_instance_name(chat_id)
+    await asyncio.to_thread(
+        send_whatsapp_media,
+        chat_id,
+        caption,
+        media_url,
+        'image',
+        None,
+        None,
+        instance_name,
+    )
+
+
 def _normalize_text(value: str) -> str:
     return value.strip().lower()
-
-
-def _extract_summary_field(text: str, pattern: str) -> str:
-    match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-    if not match:
-        return ''
-    return (match.group(1) or '').strip(' \n\t*-_')
-
-
-def _extract_order_summary_fields(reply_message: str) -> tuple[str, str, str]:
-    items = _extract_summary_field(
-        reply_message,
-        r'(?:🛒\s*\*?itens:?\*?)\s*(.+?)(?=(?:📍|\*?endere|💳|\*?pagamento|$))',
-    )
-    address = _extract_summary_field(
-        reply_message,
-        r'(?:📍\s*\*?endere[cç]o:?\*?)\s*(.+?)(?=(?:💳|\*?pagamento|$))',
-    )
-    payment = _extract_summary_field(
-        reply_message,
-        r'(?:💳\s*\*?pagamento:?\*?)\s*(.+)',
-    )
-
-    if not items:
-        bullet_lines = []
-        for line in (reply_message or '').splitlines():
-            clean = line.strip()
-            if re.match(r'^(?:🍺|•)\s*\d+\s*[xX]\s+.+', clean):
-                bullet_lines.append(re.sub(r'^(?:🍺|•)\s*', '', clean).strip())
-        if bullet_lines:
-            items = ' + '.join(bullet_lines)
-
-    if not address:
-        for line in (reply_message or '').splitlines():
-            clean = line.strip()
-            if clean.startswith('📍'):
-                address = re.sub(r'^📍\s*(?:\*?endere[cç]o:?\*?)?\s*', '', clean, flags=re.IGNORECASE).strip()
-                break
-
-    if not payment:
-        for line in (reply_message or '').splitlines():
-            clean = line.strip()
-            if clean.startswith('💳'):
-                payment = re.sub(r'^💳\s*(?:\*?pagamento:?\*?)?\s*', '', clean, flags=re.IGNORECASE).strip()
-                break
-
-    payment = payment.replace('✅', '').strip()
-    if '\n' in payment:
-        payment = payment.splitlines()[0].strip()
-    return items, address, payment
-
-
-def _extract_name_from_text(text: str) -> str:
-    patterns = (
-        r'(?i)meu nome e\s+([A-Za-zÀ-ÿ]+(?:\s+[A-Za-zÀ-ÿ]+){0,3})',
-        r'(?i)pode colocar no nome de\s+([A-Za-zÀ-ÿ]+(?:\s+[A-Za-zÀ-ÿ]+){0,3})',
-        r'(?i)nome[:\-]?\s*([A-Za-zÀ-ÿ]+(?:\s+[A-Za-zÀ-ÿ]+){0,3})',
-    )
-
-    for pattern in patterns:
-        match = re.search(pattern, text or '')
-        if match:
-            return (match.group(1) or '').strip()
-
-    return ''
-
-
-def _extract_address_from_text(text: str) -> str:
-    if not text:
-        return ''
-
-    match = re.search(
-        r'(?i)(?:moro na\s+)?((?:rua|r\.|avenida|av\.?|travessa|tv\.?|alameda|estrada|rodovia)\s+.+)',
-        text,
-    )
-    if not match:
-        return ''
-
-    address = (match.group(1) or '').strip(' ,.-')
-    address = re.sub(
-        r'(?i)(?:[\.,;:\- ]+)?(?:vou pagar|pagamento|pago no|pagar no|pix|cart[aã]o|dinheiro).*$','',
-        address,
-    ).strip(' ,.-')
-    return address
-
-
-def _extract_payment_from_text(text: str) -> str:
-    normalized = _normalize_text(text)
-    if 'pix' in normalized:
-        return 'Pix'
-    if any(token in normalized for token in ('cartao', 'cartão', 'credito', 'crédito', 'debito', 'débito')):
-        return 'Cartão'
-    if 'dinheiro' in normalized:
-        return 'Dinheiro'
-    return ''
-
-
-def _address_looks_broken(value: str) -> bool:
-    normalized = _normalize_text(value)
-    if not normalized:
-        return True
-
-    return any(
-        token in normalized
-        for token in ('tamanho ', 'pagamento', 'pix', 'cartao', 'cartão', 'dinheiro')
-    )
-
-
-def _resolve_customer_data_from_session(
-    session_key: str,
-    fallback_address: str,
-    fallback_payment: str,
-) -> tuple[str, str, str]:
-    history = get_session_history(session_key)
-    human_texts = [str(msg.content).strip() for msg in history.messages if getattr(msg, 'type', '') == 'human']
-
-    customer_name = ''
-    customer_address = '' if _address_looks_broken(fallback_address) else fallback_address.strip()
-    payment_method = fallback_payment.strip()
-
-    for text in reversed(human_texts):
-        if not customer_name:
-            customer_name = _extract_name_from_text(text)
-        if not customer_address:
-            customer_address = _extract_address_from_text(text)
-        if not payment_method:
-            payment_method = _extract_payment_from_text(text)
-        if customer_name and customer_address and payment_method:
-            break
-
-    return customer_name or 'Cliente WhatsApp', customer_address, payment_method
-
-
-def _build_cart_items_from_summary(items_text: str) -> list[dict]:
-    normalized_items = (items_text or '').strip()
-    if not normalized_items:
-        return []
-
-    quantity_match = re.match(r'^\s*(\d+)\s*[xX]\s+(.+)$', normalized_items)
-    price_match = re.search(r'R\$\s*([\d\.,]+)', normalized_items, flags=re.IGNORECASE)
-    parsed_price = 0.0
-    if price_match:
-        raw_price = price_match.group(1).replace('.', '').replace(',', '.')
-        try:
-            parsed_price = float(raw_price)
-        except ValueError:
-            parsed_price = 0.0
-
-    if quantity_match:
-        quantity = int(quantity_match.group(1))
-        product_name = quantity_match.group(2).strip()
-    else:
-        quantity = 1
-        product_name = normalized_items
-
-    # Remove sufixo de preço quando o item vier no formato "Produto — R$ 9,90".
-    product_name = re.sub(
-        r'\s*[—-]\s*R\$\s*[\d\.,]+.*$',
-        '',
-        product_name,
-        flags=re.IGNORECASE,
-    ).strip()
-
-    return [
-        {
-            'product_name': product_name,
-            'name': product_name,
-            'quantity': max(1, quantity),
-            'price': parsed_price,
-        }
-    ]
-
-
-def _has_placeholder_text(value: str) -> bool:
-    normalized = (value or '').strip().lower()
-    if not normalized:
-        return True
-    return (
-        '[' in normalized
-        or 'itens informados pelo cliente' in normalized
-        or 'endereço informado pelo cliente' in normalized
-        or 'endereco informado pelo cliente' in normalized
-        or 'pagamento informado pelo cliente' in normalized
-        or 'produto confirmado' in normalized
-    )
-
-
-def _calculate_cart_total(cart_items: list[dict]) -> float:
-    total = 0.0
-    for item in cart_items:
-        raw_price = item.get('price', 0)
-        if isinstance(raw_price, str) and raw_price.strip().startswith('['):
-            continue
-        try:
-            price = float(raw_price or 0)
-        except (TypeError, ValueError):
-            price = 0.0
-        try:
-            quantity = int(item.get('quantity') or 1)
-        except (TypeError, ValueError):
-            quantity = 1
-        total += max(0.0, price) * max(1, quantity)
-    return total
-
-
-def _clean_product_name_for_lookup(value: str) -> str:
-    cleaned = str(value or '').strip()
-    cleaned = re.sub(r'\s*[—-]\s*R\$\s*[\d\.,]+.*$', '', cleaned, flags=re.IGNORECASE).strip()
-    return cleaned
-
-
-async def _fill_cart_item_prices_from_stock(tenant_id: str, cart_items: list[dict]) -> list[dict]:
-    normalized_tenant_id = (tenant_id or '').strip()
-    if not normalized_tenant_id or not cart_items:
-        return cart_items
-
-    try:
-        stock_data = await fetch_stock_for_context(normalized_tenant_id)
-    except Exception as error:
-        log(f'Falha ao buscar estoque para precificação do pedido: {error}')
-        return cart_items
-
-    stock_items = stock_data.get('items', []) if isinstance(stock_data, dict) else []
-    if not stock_items:
-        return cart_items
-
-    price_lookup: dict[str, float] = {}
-    for product in stock_items:
-        product_name = _clean_product_name_for_lookup(str(product.get('nome') or '').strip())
-        if not product_name:
-            continue
-        try:
-            product_price = float(product.get('preco') or 0)
-        except (TypeError, ValueError):
-            continue
-        if product_price <= 0:
-            continue
-        price_lookup[_normalize_lookup(product_name)] = product_price
-
-    resolved_items: list[dict] = []
-    for item in cart_items:
-        new_item = dict(item)
-        current_price = new_item.get('price', 0)
-        try:
-            numeric_price = float(current_price or 0)
-        except (TypeError, ValueError):
-            numeric_price = 0.0
-
-        if numeric_price > 0:
-            resolved_items.append(new_item)
-            continue
-
-        source_name = (
-            str(new_item.get('base_product_name') or '').strip()
-            or str(new_item.get('product_name') or '').strip()
-            or str(new_item.get('name') or '').strip()
-        )
-        cleaned_name = _clean_product_name_for_lookup(source_name)
-        normalized_name = _normalize_lookup(cleaned_name)
-        resolved_price = 0.0
-
-        if normalized_name in price_lookup:
-            resolved_price = price_lookup[normalized_name]
-        else:
-            for candidate_name, candidate_price in price_lookup.items():
-                if normalized_name and (candidate_name in normalized_name or normalized_name in candidate_name):
-                    resolved_price = candidate_price
-                    break
-
-        if resolved_price > 0:
-            new_item['price'] = resolved_price
-            if cleaned_name:
-                new_item['product_name'] = cleaned_name
-                new_item['name'] = cleaned_name
-
-        resolved_items.append(new_item)
-
-    return resolved_items
-
-
-def _cart_items_are_invalid(cart_items: list[dict]) -> bool:
-    if not cart_items:
-        return True
-
-    for item in cart_items:
-        name = str(item.get('product_name') or item.get('name') or '').strip()
-        qty = int(item.get('quantity') or 0)
-        if not name or qty <= 0:
-            return True
-        if _has_placeholder_text(name):
-            return True
-
-    return False
-
-
-async def _persist_ai_final_order_if_needed(
-    chat_id: str,
-    tenant_id: str,
-    reply_message: str,
-) -> None:
-    normalized_reply = (reply_message or '').strip()
-    is_old_template = '*Resumo do Pedido*' in normalized_reply and normalized_reply.endswith('✅')
-    is_new_template = normalized_reply.startswith('✅ *Pedido anotado!*')
-    if not (is_old_template or is_new_template):
-        return
-
-    items_text, address, payment = _extract_order_summary_fields(normalized_reply)
-    session_key = f'{tenant_id}:{chat_id}'
-    structured_payload = await build_structured_order_payload(
-        session_key=session_key,
-        tenant_id=tenant_id,
-        fallback_items_text=items_text,
-        fallback_address=address,
-        fallback_payment=payment,
-    )
-    order_data = structured_payload.get('order') or {}
-    customer_name = str(order_data.get('customer_name') or 'Cliente WhatsApp').strip()
-    resolved_address = str(order_data.get('customer_address') or '').strip()
-    resolved_payment = str(order_data.get('payment_method') or '').strip()
-    resolved_items_text = str(order_data.get('items_text') or '').strip()
-    cart_items = [
-        {
-            'product_name': str(item.get('product_name') or '').strip(),
-            'name': str(item.get('product_name') or '').strip(),
-            'quantity': max(1, int(item.get('quantity') or 1)),
-            'price': float(item.get('price') or 0),
-        }
-        for item in (order_data.get('items') or [])
-        if str(item.get('product_name') or '').strip()
-    ]
-
-    effective_items_text = items_text or resolved_items_text
-
-    if not cart_items and effective_items_text:
-        cart_items = _build_cart_items_from_summary(effective_items_text)
-
-    if not effective_items_text or not resolved_address or not resolved_payment:
-        log('Resumo final detectado, mas campos obrigatórios incompletos para persistência.')
-        return
-
-    if _has_placeholder_text(effective_items_text) or _has_placeholder_text(resolved_address) or _has_placeholder_text(resolved_payment):
-        logger.warning('[ORDER] Tentativa de salvar pedido com placeholders — abortando persistência')
-        return
-
-    context_key = _context_key(chat_id)
-    fingerprint = f'{effective_items_text}|{resolved_address}|{resolved_payment}'.strip().lower()
-    last_fingerprint = (await redis_client.hget(context_key, 'last_order_fingerprint') or '').strip().lower()
-    if last_fingerprint and last_fingerprint == fingerprint:
-        log('Pedido final já persistido anteriormente para este chat; ignorando duplicidade.')
-        return
-
-    if _cart_items_are_invalid(cart_items):
-        logger.warning('[ORDER] Tentativa de salvar pedido com dados inválidos — abortando')
-        return
-
-    total_calculado = _calculate_cart_total(cart_items)
-    if total_calculado == 0:
-        cart_items = await _fill_cart_item_prices_from_stock(tenant_id, cart_items)
-        total_calculado = _calculate_cart_total(cart_items)
-
-    logger.info('[ORDER] total calculado: R$%.2f', total_calculado)
-
-    try:
-        await save_order(
-            tenant_id=tenant_id,
-            phone=chat_id,
-            nome=customer_name,
-            endereco=resolved_address,
-            cart_items=cart_items,
-            total=total_calculado,
-            forma_pagamento=resolved_payment,
-        )
-        await redis_client.hset(
-            context_key,
-            mapping={
-                'last_order_fingerprint': fingerprint,
-                'last_structured_order_payload': json.dumps(structured_payload, ensure_ascii=False),
-            },
-        )
-        await redis_client.delete(f'session:{tenant_id}:{chat_id}:produto_confirmado')
-        await redis_client.setex(f'session:{tenant_id}:{chat_id}:last_order_time', 3600, str(time.time()))
-        await clear_order_context(chat_id)
-        clear_session_history(session_key)
-        log(f'Pedido persistido no Kanban para {tenant_id}:{chat_id}')
-    except Exception as error:
-        log(f'Falha ao persistir pedido no Kanban: {error}')
 
 
 async def _load_grouped_products(tenant_id: str) -> dict[str, dict]:
     try:
         grouped_products = await asyncio.to_thread(list_estoque, tenant_id)
     except Exception as error:
-        # Keep chat flow alive even when Sheets auth/dependency fails.
-        log(f'Erro ao carregar estoque no Sheets: {error}')
+        log(f'Erro ao carregar estoque no banco: {error}')
         return {}
     return grouped_products
 
@@ -950,23 +683,16 @@ async def _send_product_media_if_available(chat_id: str, product_group: dict, ca
         return
 
     try:
-        await asyncio.to_thread(
-            send_whatsapp_media,
-            chat_id,
-            caption,
-            media_url,
-        )
+        await _send_media(chat_id, caption, media_url)
     except Exception as error:
         log(f'Falha ao enviar imagem do produto: {error}')
 
 
-async def _send_welcome_sequence(chat_id: str, instance_name: str):
+async def _send_welcome_sequence(chat_id: str):
     try:
-        await asyncio.to_thread(
-            send_whatsapp_message,
+        await _send_message(
             chat_id,
             '💪 Bem-vindo(a) ao atendimento da Bora Treinar Suplementos! O seu parceiro na busca pelos melhores resultados. 🏆',
-            instance_name,
         )
     except Exception as error:
         log(f'Falha ao enviar boas-vindas para {chat_id}: {error}')
@@ -976,15 +702,62 @@ async def _send_welcome_sequence(chat_id: str, instance_name: str):
         return
 
     try:
-        await asyncio.to_thread(
-            send_whatsapp_image_file,
-            chat_id,
-            str(WELCOME_IMAGE_PATH),
-            '',
-            instance_name,
-        )
+        await _send_image(chat_id, str(WELCOME_IMAGE_PATH), '')
     except Exception as error:
         log(f'Falha ao enviar imagem de boas-vindas para {chat_id}: {error}')
+
+
+async def _restart_flow(chat_id: str):
+    await clear_order_context(chat_id)
+    await _save_context(
+        chat_id,
+        {
+            'customer_name': '',
+            'customer_address': '',
+            'payment_method': '',
+            'selected_parent_code': '',
+            'selected_quantity': '',
+            'cart_items': json.dumps([]),
+        },
+    )
+    await _set_state(chat_id, STATE_MENU_INICIAL)
+    await _send_welcome_sequence(chat_id)
+    return get_main_menu_text()
+
+
+async def _send_catalog_and_transition(chat_id: str, tenant_id: str) -> str:
+    if CATALOG_IMAGE_PATH.exists():
+        try:
+            await _send_image(chat_id, str(CATALOG_IMAGE_PATH), '🛍️ Confira nosso catálogo!')
+        except Exception as error:
+            log(f'Falha ao enviar imagem do catálogo para {chat_id}: {error}')
+
+    grouped_products = await _load_grouped_products(tenant_id)
+    all_products = _flatten_products(grouped_products)
+    if not all_products:
+        await _set_state(chat_id, STATE_ADICIONANDO_CARRINHO)
+        return '📦 No momento estamos sem produtos disponíveis no estoque. Tente novamente em instantes.'
+
+    await _set_state(chat_id, STATE_ESCOLHENDO_CATEGORIA)
+    return get_category_menu_text()
+
+
+async def _send_catalog_for_products(chat_id: str, category_name: str, products: dict[str, dict]) -> str:
+    product_list = list(products.values())
+    if not product_list:
+        await _set_state(chat_id, STATE_ESCOLHENDO_CATEGORIA)
+        return 'Essa categoria está sem produtos no momento. Escolha outra categoria.'
+
+    first_product = product_list[0]
+    first_image_url = str(first_product.get('imagem_url', '')).strip()
+    if _is_valid_media_url(first_image_url):
+        try:
+            await _send_media(chat_id, f'🔥 Destaques de {category_name}', first_image_url)
+        except Exception as error:
+            log(f'Falha ao enviar imagem da categoria: {error}')
+
+    await _set_state(chat_id, STATE_ADICIONANDO_CARRINHO)
+    return get_catalog_text(products)
 
 
 def _build_admin_summary(pedido: dict) -> str:
@@ -1022,326 +795,622 @@ async def _get_checkout_customer(chat_id: str, context: dict, tenant_id: str) ->
     )
 
 
-async def process_message(chat_id: str, user_message: str, tenant_id: str, instance_name: str) -> str:
-    logger.info(f"[PROCESS] tenant_id={tenant_id} sub_nicho=<not_loaded_yet> msg='{user_message[:50]}'")
-    # Modo IA pura: sem fluxos de menu/carrinho/checkout.
-    # PARTE 1: ROTEADOR DE SCRIPT — detecta intenções e responde com script sem gastar tokens
-    conversation_id = f'{tenant_id}:{chat_id}'
+async def _move_to_upsell(chat_id: str, customer_name: str, customer_address: str, cart_items: list[dict]) -> str:
+    await _save_context(
+        chat_id,
+        {
+            'customer_name': customer_name,
+            'customer_address': customer_address,
+            'cart_items': json.dumps(cart_items),
+            'selected_parent_code': '',
+            'selected_quantity': '',
+        },
+    )
+    await _set_state(chat_id, STATE_ADICIONANDO_CARRINHO)
 
-    try:
-        tenant_configs = await get_tenant_configs(tenant_id)
-        logger.info('[ROUTER] sub_nicho: %s', tenant_configs.get('sub_nicho'))
-
-        produto_confirmado_key = f'session:{tenant_id}:{chat_id}:produto_confirmado'
-        last_order_key = f'session:{tenant_id}:{chat_id}:last_order_time'
-        last_order_raw = await redis_client.get(last_order_key)
-        if last_order_raw:
-            try:
-                elapsed = time.time() - float(last_order_raw)
-            except (TypeError, ValueError):
-                elapsed = 0.0
-            if elapsed > 300:
-                await redis_client.delete(produto_confirmado_key)
-                await clear_order_context(chat_id)
-                clear_session_history(conversation_id)
-                logger.info('[SESSION] Contexto limpo após %.0fs do último pedido', elapsed)
-    except Exception as error:
-        log(f'Erro ao carregar configs do tenant no banco: {error}')
-        tenant_configs = {
-            'promptIa': '',
-            'whatsappAdmin': '',
-            'botObjective': 'FECHAR_PEDIDO',
-        }
-
-    # 1.1 — Verificar se está fora do horário
-    horarios = tenant_configs.get('horarios', [])
-    if horarios and not is_within_hours(horarios):
-        log(f'Chat {chat_id} fora do horário — retornando resposta de fechado')
-        return resposta_fora_horario(tenant_configs)
-
-    # Fluxo dedicado para pizzaria: evita loop de confirmação no fluxo geral de IA.
-    sub_nicho = str(tenant_configs.get('sub_nicho') or '').strip().lower()
-    if sub_nicho == 'pizzaria':
-        session_key = f'pizza_session:{tenant_id}:{chat_id}'
-        session_raw = await redis_client.get(session_key)
-        try:
-            session = json.loads(session_raw) if session_raw else {}
-        except Exception:
-            session = {}
-
-        try:
-            estoque = await fetch_stock_for_context(tenant_id)
-        except Exception as error:
-            log(f'Erro ao carregar cardápio de pizzaria: {error}')
-            estoque = {}
-
-        cardapio = estoque.get('sabores', []) if isinstance(estoque, dict) else []
-        tamanhos = estoque.get('tamanhos', []) if isinstance(estoque, dict) else []
-        bordas = estoque.get('bordas', []) if isinstance(estoque, dict) else []
-
-        resposta, session_atualizada = process_pizza_message(
-            text=user_message,
-            session=session,
-            cardapio=cardapio,
-            tamanhos=tamanhos,
-            bordas=bordas,
-            tenant_config=tenant_configs,
-        )
-
-        await redis_client.setex(session_key, 1800, json.dumps(session_atualizada, ensure_ascii=False))
-
-        if session_atualizada.get('state') == PizzaState.FINALIZADO.value:
-            try:
-                await save_pizza_order(tenant_id=tenant_id, phone=chat_id, session=session_atualizada)
-            except Exception as error:
-                log(f'Falha ao persistir pedido de pizzaria: {error}')
-            await redis_client.delete(session_key)
-
-        return resposta
-
-    # Fluxo dedicado para adega
-    if sub_nicho == 'adega':
-        session_key = f'adega_session:{tenant_id}:{chat_id}'
-        session_raw = await redis_client.get(session_key)
-        try:
-            session = json.loads(session_raw) if session_raw else {}
-        except Exception:
-            session = {}
-
-        try:
-            estoque_data = await fetch_stock_for_context(tenant_id)
-        except Exception as error:
-            log(f'Erro ao carregar estoque de adega: {error}')
-            estoque_data = {}
-
-        estoque = estoque_data.get('items', []) if isinstance(estoque_data, dict) else []
-
-        resposta, session_atualizada = process_adega_message(
-            text=user_message,
-            session=session,
-            estoque=estoque,
-            tenant_config=tenant_configs,
-        )
-
-        if resposta is not None:
-            await redis_client.setex(session_key, 1800, json.dumps(session_atualizada, ensure_ascii=False))
-            if session_atualizada.get('state') == AdegaState.FINALIZADO.value:
-                try:
-                    payload = save_adega_order_payload(session_atualizada)
-                    await save_order(
-                        tenant_id=tenant_id,
-                        phone=chat_id,
-                        nome='Cliente WhatsApp',
-                        endereco=payload['endereco'],
-                        cart_items=[{
-                            'product_name': payload['produto'],
-                            'name': payload['produto'],
-                            'quantity': payload['quantidade'],
-                            'price': payload['total'] / max(payload['quantidade'], 1),
-                        }],
-                        total=payload['total'],
-                        forma_pagamento=payload['pagamento'],
-                    )
-                except Exception as error:
-                    log(f'Falha ao persistir pedido de adega: {error}')
-                await redis_client.delete(session_key)
-            return resposta
-        # resposta é None → continuar para intent detection e fallback de IA
-
-    # Fluxo dedicado para lanchonete
-    if sub_nicho == 'lanchonete':
-        session_key = f'lanchonete_session:{tenant_id}:{chat_id}'
-        session_raw = await redis_client.get(session_key)
-        try:
-            session = json.loads(session_raw) if session_raw else {}
-        except Exception:
-            session = {}
-
-        try:
-            estoque_data = await fetch_stock_for_context(tenant_id)
-        except Exception as error:
-            log(f'Erro ao carregar estoque de lanchonete: {error}')
-            estoque_data = {}
-
-        estoque = estoque_data.get('items', []) if isinstance(estoque_data, dict) else []
-
-        resposta, session_atualizada = process_lanchonete_message(
-            text=user_message,
-            session=session,
-            estoque=estoque,
-            tenant_config=tenant_configs,
-        )
-
-        if resposta is not None:
-            await redis_client.setex(session_key, 1800, json.dumps(session_atualizada, ensure_ascii=False))
-            if session_atualizada.get('state') == LanchoneteState.FINALIZADO.value:
-                try:
-                    payload = save_lanchonete_order_payload(session_atualizada)
-                    cart_items = [
-                        {
-                            'product_name': item['nome'],
-                            'name': item['nome'],
-                            'quantity': item['quantidade'],
-                            'price': item['preco'],
-                        }
-                        for item in payload['carrinho']
-                    ]
-                    await save_order(
-                        tenant_id=tenant_id,
-                        phone=chat_id,
-                        nome='Cliente WhatsApp',
-                        endereco=payload['endereco'],
-                        cart_items=cart_items,
-                        total=payload['total'],
-                        forma_pagamento=payload['pagamento'],
-                    )
-                except Exception as error:
-                    log(f'Falha ao persistir pedido de lanchonete: {error}')
-                await redis_client.delete(session_key)
-            return resposta
-        # resposta é None → continuar para intent detection e fallback de IA
-
-    # 1.2 — Detectar intenção de script
-    intent = detect_intent(user_message)
-    log(f'Intenção detectada para {chat_id}: {intent}')
-
-    # 1.3 — Responder com script baseado em intenção
-    if intent:
-        try:
-            if intent == 'saudacao':
-                # Saudações: responder só se for primeira mensagem
-                historico = get_session_history(conversation_id)
-                if not historico.messages:
-                    log(f'Chat {chat_id} — cumprimento em sessão nova')
-                    return resposta_saudacao(tenant_configs)
-                # Se já tem histórico, deixar IA responder naturalmente
-
-            elif intent == 'horario':
-                log(f'Chat {chat_id} — pergunta sobre horário')
-                return resposta_horario(tenant_configs)
-
-            elif intent == 'entrega':
-                log(f'Chat {chat_id} — pergunta sobre entrega')
-                return resposta_entrega(tenant_configs)
-
-            elif intent == 'status_pedido':
-                log(f'Chat {chat_id} — pergunta sobre status')
-                ultimo_pedido = await asyncio.to_thread(
-                    get_ultimo_pedido,
-                    phone=chat_id,
-                    tenant_id=tenant_id,
-                )
-                return resposta_status_pedido(ultimo_pedido)
-
-            elif intent == 'cardapio':
-                log(f'Chat {chat_id} — pedido de cardápio')
-                estoque = await fetch_stock_for_context(tenant_id)
-                return resposta_cardapio(tenant_configs, estoque)
-
-            elif intent == 'cancelar':
-                log(f'Chat {chat_id} — solicitação cancelamento')
-                return resposta_cancelamento_confirmacao(tenant_configs)
-
-            elif intent == 'fechar_pedido':
-                log(f'Chat {chat_id} — intenção de fechamento de pedido')
-                history = get_session_history(conversation_id)
-                payload = await build_order_payload_from_history_window_async(
-                    history_window=list(history.messages),
-                    user_message=user_message,
-                    tenant_id=tenant_id,
-                )
-                order_data = payload.get('order') or {}
-                items = order_data.get('items') or []
-                address = str(order_data.get('customer_address') or '').strip()
-                payment = str(order_data.get('payment_method') or '').strip()
-
-                if items and not address:
-                    if payment:
-                        return f'Anotado! Pagamento no {payment}. Me manda o endereço pra entrega 📍'
-                    return 'Ótimo! Me manda o endereço pra entrega 📍'
-
-                if items and address and not payment:
-                    return 'Qual forma de pagamento? Pix, dinheiro ou cartão?'
-
-                if items and address and payment:
-                    cart_items = [
-                        {
-                            'product_name': str(item.get('product_name') or '').strip(),
-                            'name': str(item.get('product_name') or '').strip(),
-                            'quantity': max(1, int(item.get('quantity') or 1)),
-                            'price': float(item.get('price') or 0),
-                        }
-                        for item in items
-                        if str(item.get('product_name') or '').strip()
-                    ]
-                    summary, _ = build_checkout_summary(
-                        cart_items=cart_items,
-                        address=address,
-                        payment_method=payment,
-                        nome_negocio=str(tenant_configs.get('nome_negocio') or 'nossa loja'),
-                        tenant_id=tenant_id,
-                    )
-                    if summary:
-                        return summary
-
-                return 'Perfeito! Me confirma só o item e a quantidade para eu fechar certinho.'
-
-        except Exception as error:
-            log(f'Erro ao processar intenção {intent}: {error}')
-            # Cai no fluxo normal da IA se houver erro
-
-    # PARTE 2: FLUXO IA NORMAL — nenhum script bateu, chamar Gemini
-    log(f'Chat {chat_id} — roteador não bateu, enviando para IA')
-    prompt_ia = tenant_configs.get('promptIa') or None
-    bot_objective = tenant_configs.get('botObjective') or 'FECHAR_PEDIDO'
-    instruction = (
-        'Responda ao cliente de forma natural, útil e objetiva. '
-        'Não use menus numerados nem conduza fluxo fixo. '
-        'Se faltar contexto, faça uma pergunta curta para clarificar.'
+    summary, total = build_cart_summary(cart_items)
+    return _with_quick_commands(
+        f'✅ Item adicionado ao carrinho.\n\n'
+        f'🛒 *Carrinho atual:*\n{summary}\n\n'
+        f'Total parcial: *{format_brl(total)}*\n\n'
+        'Envie outro código para continuar, *carrinho* para revisar ou *finalizar* para fechar.'
     )
 
-    try:
-        return await asyncio.to_thread(
-            generate_persona_response,
-            instruction,
-            user_message,
-            conversation_id,
-            prompt_ia,
-            bot_objective,
-            tenant_id,
-        )
-    except Exception as error:
-        log(f'Erro ao gerar resposta da IA: {error}')
+
+async def _move_to_upsell_with_message(
+    chat_id: str,
+    customer_name: str,
+    customer_address: str,
+    cart_items: list[dict],
+    intro_message: str,
+) -> str:
+    await _save_context(
+        chat_id,
+        {
+            'customer_name': customer_name,
+            'customer_address': customer_address,
+            'cart_items': json.dumps(cart_items),
+            'selected_parent_code': '',
+            'selected_quantity': '',
+        },
+    )
+    await _set_state(chat_id, STATE_ADICIONANDO_CARRINHO)
+
+    summary, total = build_cart_summary(cart_items)
+    return _with_quick_commands(
+        f'{intro_message}\n\n'
+        f'🛒 *Carrinho atual:*\n{summary}\n\n'
+        f'Total parcial: *{format_brl(total)}*\n\n'
+        'Envie outro código para continuar, *carrinho* para revisar ou *finalizar* para fechar.'
+    )
+
+
+async def route_sales_flow(chat_id: str, user_message: str) -> str:
+    normalized_message = _normalize_text(user_message)
+
+    state = await _get_state(chat_id) or STATE_VERIFICACAO_INICIAL
+    tenant_id = await _get_tenant_id(chat_id)
+    if not tenant_id:
+        log(f'Tenant ausente para {chat_id} ao processar fluxo de vendas.')
         return (
-            '⚠️ Estou com instabilidade momentânea para responder agora. '
-            'Pode repetir sua mensagem em alguns segundos?'
+            '⚠️ Não consegui identificar sua loja agora. '
+            'Envie uma nova mensagem em alguns segundos para tentarmos novamente.'
         )
 
+    if state == STATE_ATENDIMENTO_HUMANO:
+        return ''
 
-async def buffer_message(chat_id: str, message: str, tenant_id: str, instance_name: str):
-    session_key = f'{tenant_id}:{chat_id}'
-    buffer_key = f'{session_key}{BUFFER_KEY_SUFIX}'
+    if state != STATE_ATENDIMENTO_HUMANO and normalized_message in {'menu'}:
+        await _set_state(chat_id, STATE_MENU_INICIAL)
+        return get_main_menu_text()
+
+    if normalized_message in {'/cancelar', '/cancel', 'cancelar', 'cancel'}:
+        return await _restart_flow(chat_id)
+
+    context = await _get_context(chat_id)
+    cart_items = json.loads(context.get('cart_items', '[]'))
+    customer_name = context.get('customer_name', '').strip()
+    customer_address = context.get('customer_address', '').strip()
+
+    if state == STATE_VERIFICACAO_INICIAL:
+        await _save_context(
+            chat_id,
+            {
+                'customer_name': customer_name,
+                'customer_address': customer_address,
+                'cart_items': json.dumps(cart_items),
+            },
+        )
+        await _set_state(chat_id, STATE_MENU_INICIAL)
+        await _send_welcome_sequence(chat_id)
+        return get_main_menu_text()
+
+    if state == STATE_MENU_INICIAL:
+        menu_choice = _extract_menu_choice(normalized_message)
+
+        if menu_choice == 1:
+            return await _send_catalog_and_transition(chat_id)
+
+        if menu_choice == 2:
+            await _set_state(chat_id, STATE_DUVIDAS_SUPLEMENTOS)
+            return (
+                '🤔 Manda sua dúvida sobre suplementos que eu te ajudo agora.\n'
+                'Ex.: "qual a diferença entre whey concentrado e isolado?"\n\n'
+                'Se quiser voltar, digite *menu*.'
+            )
+
+        if menu_choice == 3:
+            try:
+                ultimo_pedido = await asyncio.to_thread(get_ultimo_pedido, chat_id, tenant_id)
+            except Exception as error:
+                log(f'Erro ao buscar último pedido no banco: {error}')
+                return '⚠️ Não consegui consultar seu último pedido agora.\n\n' + get_main_menu_text()
+
+            if not ultimo_pedido:
+                return '📦 Você ainda não possui pedidos recentes por aqui.\n\n' + get_main_menu_text()
+
+            status = ultimo_pedido.get('status') or 'sem status'
+            itens = ultimo_pedido.get('itens_resumo') or 'Itens não informados'
+            return (
+                '📦 *Status do seu último pedido:*\n'
+                f'*Status:* {status}\n'
+                f'*Itens:*\n{itens}\n\n'
+                f'{get_main_menu_text()}'
+            )
+
+        if menu_choice == 4:
+            await _set_state(chat_id, STATE_ATENDIMENTO_HUMANO)
+            return '🤝 Perfeito. Já sinalizei um atendente humano para te chamar em instantes.'
+
+        return 'Não entendi a opção. Responda com 1, 2, 3 ou 4.\n\n' + get_main_menu_text()
+
+    if state == STATE_DUVIDAS_SUPLEMENTOS:
+        if 'whey' in normalized_message or 'wey' in normalized_message:
+            return get_whey_guidance_text()
+
+        try:
+            answer = await asyncio.to_thread(invoke_rag_chain, user_message, chat_id)
+        except Exception as error:
+            log(f'Erro ao responder dúvida com RAG: {error}')
+            return (
+                '⚠️ Não consegui consultar as informações agora. Tente novamente em instantes '
+                'ou digite *menu* para voltar.'
+            )
+
+        if not str(answer).strip():
+            return 'Não encontrei essa informação agora. Reformule sua dúvida ou digite *menu* para voltar.'
+
+        return f'{answer}\n\nSe quiser, pode mandar outra dúvida ou digitar *menu* para voltar.'
+
+    if state == STATE_CATALOGO:
+        return await _send_catalog_and_transition(chat_id, tenant_id)
+
+    if state == STATE_ESCOLHENDO_CATEGORIA:
+        if normalized_message in {'catalogo', 'catálogo'}:
+            grouped_products = await _load_grouped_products(tenant_id)
+            categories = _fixed_category_options(grouped_products)
+            if not any(category.get('produtos') for category in categories):
+                return '📦 No momento estamos sem produtos disponíveis no estoque. Tente novamente em instantes.'
+            return get_category_menu_text()
+
+        if 'whey' in normalized_message or 'wey' in normalized_message:
+            await _set_state(chat_id, STATE_DUVIDAS_SUPLEMENTOS)
+            return get_whey_guidance_text()
+
+        choice = _extract_category_choice(normalized_message)
+        if choice is None:
+            return 'Responda com o número da categoria desejada (ou escreva o nome, ex.: proteínas).'
+
+        grouped_products = await _load_grouped_products(tenant_id)
+        categories = _fixed_category_options(grouped_products)
+
+        if not any(category.get('produtos') for category in categories):
+            return '📦 No momento estamos sem produtos disponíveis no estoque. Tente novamente em instantes.'
+
+        if choice == 0:
+            await _set_state(chat_id, STATE_MENU_INICIAL)
+            return get_main_menu_text()
+
+        if choice < 1 or choice > len(categories):
+            return (
+                f'Opção inválida. Escolha um número de 0 a {len(categories)}.\n\n'
+                f'{get_category_menu_text()}'
+            )
+
+        selected = categories[choice - 1]
+        return await _send_catalog_for_products(
+            chat_id,
+            selected['categoria'],
+            selected['produtos'],
+        )
+
+    if state == STATE_ADICIONANDO_CARRINHO:
+        if normalized_message in {'catalogo', 'catálogo', 'menu'}:
+            return await _send_catalog_and_transition(chat_id, tenant_id)
+
+        if normalized_message == 'carrinho':
+            summary, total = build_cart_summary(cart_items)
+            return _with_quick_commands(
+                f'🛒 *Seu carrinho:*\n{summary}\n\nTotal: *{format_brl(total)}*'
+            )
+
+        if normalized_message == 'finalizar':
+            if not cart_items:
+                return 'Seu carrinho está vazio. Envie um código para adicionar um produto. 💊'
+
+            customer_name, customer_address = await _get_checkout_customer(chat_id, context, tenant_id)
+
+            await _save_context(
+                chat_id,
+                {
+                    'customer_name': customer_name,
+                    'customer_address': customer_address,
+                    'cart_items': json.dumps(cart_items),
+                },
+            )
+
+            if not customer_name:
+                await _set_state(chat_id, STATE_CHECKOUT_NOME)
+                return '🧾 Para finalizar, me diga seu *nome completo*.'
+
+            if not customer_address:
+                await _set_state(chat_id, STATE_CHECKOUT_ENDERECO)
+                return '📦 Agora me informe seu *endereço completo* para entrega.'
+
+            await _set_state(chat_id, STATE_CHECKOUT_PAGAMENTO)
+            return get_payment_prompt_text()
+
+        grouped_products = await _load_grouped_products(tenant_id)
+        product_map = _grouped_products_by_code(grouped_products)
+        if not product_map:
+            return '📦 No momento estamos sem produtos disponíveis no estoque. Tente novamente em instantes.'
+
+        parser_catalog = _catalog_for_intent_parser(product_map)
+
+        # ── NLU: Gemini analisa intenção, produto e dados faltantes ──────────
+        nlu = await analyze_message(user_message, cart_items, parser_catalog)
+        intencao = nlu.get('intencao', '')
+        log(f'NLU para {chat_id}: intencao={intencao!r}')
+
+        # ── 1. Dúvida técnica → RAG (ChromaDB + OpenAI) ──────────────────────
+        if intencao == 'duvida_tecnica':
+            try:
+                answer = await asyncio.to_thread(invoke_rag_chain, user_message, chat_id)
+                return answer or await asyncio.to_thread(
+                    generate_persona_response,
+                    f'O usuário perguntou "{user_message}". Informe que não encontrou a resposta e ofereça atendimento humano.',
+                    user_message,
+                    chat_id,
+                )
+            except Exception as err:
+                log(f'Erro ao chamar RAG chain: {err}')
+                await _set_state(chat_id, STATE_ATENDIMENTO_HUMANO)
+                return await asyncio.to_thread(
+                    generate_persona_response,
+                    'Não consegui consultar as informações agora. Direcione o cliente para um atendente humano.',
+                    user_message,
+                    chat_id,
+                )
+
+        # ── 2. Ver carrinho via linguagem natural ─────────────────────────────
+        if intencao == 'ver_carrinho':
+            summary, total = build_cart_summary(cart_items)
+            instruction = (
+                f'Mostre o carrinho do cliente de forma animada. '
+                f'Itens: {summary}. Total: {format_brl(total)}. '
+                'Oriente a enviar "finalizar" para fechar o pedido ou continue adicionando itens.'
+            )
+            return await asyncio.to_thread(generate_persona_response, instruction, user_message, chat_id)
+
+        # ── 3. Checkout via linguagem natural ─────────────────────────────────
+        if intencao == 'checkout':
+            if not cart_items:
+                return await asyncio.to_thread(
+                    generate_persona_response,
+                    'O cliente quer finalizar, mas o carrinho está vazio. Peça para adicionar produtos primeiro.',
+                    user_message,
+                    chat_id,
+                )
+            customer_name, customer_address = await _get_checkout_customer(chat_id, context, tenant_id)
+            await _save_context(
+                chat_id,
+                {
+                    'customer_name': customer_name,
+                    'customer_address': customer_address,
+                    'cart_items': json.dumps(cart_items),
+                },
+            )
+            if not customer_name:
+                await _set_state(chat_id, STATE_CHECKOUT_NOME)
+                return await asyncio.to_thread(
+                    generate_persona_response,
+                    'O cliente quer finalizar o pedido. Peça o nome completo de forma animada.',
+                    user_message,
+                    chat_id,
+                )
+            if not customer_address:
+                await _set_state(chat_id, STATE_CHECKOUT_ENDERECO)
+                return await asyncio.to_thread(
+                    generate_persona_response,
+                    'O cliente quer finalizar. Peça o endereço completo para entrega.',
+                    user_message,
+                    chat_id,
+                )
+            await _set_state(chat_id, STATE_CHECKOUT_PAGAMENTO)
+            return await asyncio.to_thread(
+                generate_persona_response,
+                'Pergunte a forma de pagamento. Opções: 1 - Pix, 2 - Cartão, 3 - Dinheiro.',
+                user_message,
+                chat_id,
+            )
+
+        # ── 4. Solicitação de atendimento humano ──────────────────────────────
+        if intencao == 'atendimento_humano':
+            await _set_state(chat_id, STATE_ATENDIMENTO_HUMANO)
+            return await asyncio.to_thread(
+                generate_persona_response,
+                'O cliente pediu atendimento humano. Informe que um atendente entrará em contato em breve.',
+                user_message,
+                chat_id,
+            )
+
+        # ── 5. Adicionar ao carrinho ──────────────────────────────────────────
+        if intencao == 'adicionar_carrinho':
+            produto = nlu.get('produto_identificado') or {}
+            status_item = nlu.get('status_item', '')
+            dados_faltantes = nlu.get('dados_faltantes') or []
+            upsell_sugerido = nlu.get('upsell_sugerido')
+
+            # 5a. Produto incompleto: pedir dados faltantes via persona
+            if status_item == 'incompleto':
+                categoria = produto.get('categoria') or 'produto'
+                faltantes_str = ', '.join(dados_faltantes) if dados_faltantes else 'mais detalhes (marca, sabor ou tamanho)'
+                instruction = (
+                    f'O cliente quer {categoria}, mas ainda faltam: {faltantes_str}. '
+                    'Pergunte de forma animada e objetiva quais informações estão faltando.'
+                )
+                return await asyncio.to_thread(generate_persona_response, instruction, user_message, chat_id)
+
+            # 5b. Produto completo: adicionar ao carrinho e confirmar via persona
+            if status_item == 'completo':
+                codigo_pai = str(produto.get('codigo_pai') or '').strip().lower()
+                variacao_name = str(produto.get('variacao') or '').strip()
+                try:
+                    quantidade = max(1, int(produto.get('quantidade', 1)))
+                except (TypeError, ValueError):
+                    quantidade = 1
+
+                if not codigo_pai:
+                    instruction = (
+                        f'O produto "{produto.get("categoria", "item")} {produto.get("marca", "")}" '
+                        'não foi encontrado no catálogo. Oriente o cliente a ver o catálogo disponível.'
+                    )
+                    return await asyncio.to_thread(generate_persona_response, instruction, user_message, chat_id)
+
+                product_group = product_map.get(codigo_pai)
+                if not product_group:
+                    instruction = (
+                        f'O produto com código "{codigo_pai}" não está disponível. '
+                        'Oriente o cliente a ver o catálogo.'
+                    )
+                    return await asyncio.to_thread(generate_persona_response, instruction, user_message, chat_id)
+
+                chosen_variation = _find_catalog_variation(product_group, variacao_name)
+                if not chosen_variation:
+                    return get_variation_options_text(product_group)
+
+                _add_item_to_cart(cart_items, product_group, chosen_variation, quantidade)
+
+                chosen_variation_label = str(chosen_variation.get('variacao', '')).strip() or 'Unico'
+                upsell_str = f' Sugira também: {upsell_sugerido}.' if upsell_sugerido else ''
+                instruction = (
+                    f'Confirme que adicionamos {product_group.get("nome_produto", "")} '
+                    f'({chosen_variation_label}) x{quantidade} ao carrinho.{upsell_str} '
+                    'Seja animado. Não liste o carrinho completo aqui, apenas confirme o item adicionado.'
+                )
+                intro = await asyncio.to_thread(generate_persona_response, instruction, user_message, chat_id)
+                return await _move_to_upsell_with_message(
+                    chat_id,
+                    customer_name,
+                    customer_address,
+                    cart_items,
+                    intro,
+                )
+
+        # ── 6. Fallback: intenção não reconhecida ─────────────────────────────
+        instruction = (
+            f'O cliente enviou uma mensagem não reconhecida: "{user_message}". '
+            'Oriente-o de forma amigável a informar se quer adicionar um produto, '
+            'ver o carrinho, finalizar o pedido ou falar com um atendente.'
+        )
+        return await asyncio.to_thread(generate_persona_response, instruction, user_message, chat_id)
+
+    if state == STATE_AGUARDANDO_VARIACAO:
+        choice_index = _extract_numeric_choice(normalized_message)
+        if choice_index is None:
+            return 'Responda apenas com o número da variação desejada. Exemplo: 1.'
+
+        selected_parent_code = context.get('selected_parent_code', '').strip()
+        selected_quantity_raw = context.get('selected_quantity', '1').strip()
+
+        if not selected_parent_code:
+            await _set_state(chat_id, STATE_ADICIONANDO_CARRINHO)
+            return 'Não encontrei o produto em seleção. Envie o código novamente para continuar.'
+
+        try:
+            selected_quantity = int(selected_quantity_raw)
+        except ValueError:
+            selected_quantity = 1
+
+        if selected_quantity <= 0:
+            selected_quantity = 1
+
+        grouped_products = await _load_grouped_products(tenant_id)
+        product_map = _grouped_products_by_code(grouped_products)
+        product_group = product_map.get(selected_parent_code.lower())
+
+        if not product_group:
+            await _save_context(
+                chat_id,
+                {
+                    'customer_name': customer_name,
+                    'customer_address': customer_address,
+                    'cart_items': json.dumps(cart_items),
+                    'selected_parent_code': '',
+                    'selected_quantity': '',
+                },
+            )
+            await _set_state(chat_id, STATE_ADICIONANDO_CARRINHO)
+            return 'Esse produto não está mais disponível. Escolha outro código no catálogo.'
+
+        variations = product_group.get('variacoes', [])
+        if choice_index < 1 or choice_index > len(variations):
+            return f'Opção inválida. Escolha um número de 1 a {len(variations)}.'
+
+        chosen_variation = variations[choice_index - 1]
+        _add_item_to_cart(cart_items, product_group, chosen_variation, selected_quantity)
+
+        return await _move_to_upsell(chat_id, customer_name, customer_address, cart_items)
+
+    if state == STATE_CHECKOUT_NOME:
+        if len(user_message.strip()) < 2:
+            return 'Nome inválido. Informe um nome com pelo menos 2 caracteres.'
+
+        customer_name = user_message.strip()
+        await _save_context(
+            chat_id,
+            {
+                'customer_name': customer_name,
+                'customer_address': customer_address,
+                'cart_items': json.dumps(cart_items),
+            },
+        )
+
+        if not customer_address:
+            await _set_state(chat_id, STATE_CHECKOUT_ENDERECO)
+            return '📦 Agora me informe seu *endereço completo* para entrega.'
+
+        await _set_state(chat_id, STATE_CHECKOUT_PAGAMENTO)
+        return get_payment_prompt_text()
+
+    if state == STATE_CHECKOUT_ENDERECO:
+        if len(user_message.strip()) < 5:
+            return 'Endereço muito curto. Informe rua e número, por favor.'
+
+        customer_address = user_message.strip()
+        await _save_context(
+            chat_id,
+            {
+                'customer_name': customer_name,
+                'customer_address': customer_address,
+                'cart_items': json.dumps(cart_items),
+            },
+        )
+
+        if not customer_name:
+            await _set_state(chat_id, STATE_CHECKOUT_NOME)
+            return '🧾 Para finalizar, me diga seu *nome completo*.'
+
+        await _set_state(chat_id, STATE_CHECKOUT_PAGAMENTO)
+        return get_payment_prompt_text()
+
+    if state == STATE_CHECKOUT_PAGAMENTO:
+        payment_choice = _extract_numeric_choice(normalized_message)
+        payment_method = _payment_label(str(payment_choice)) if payment_choice is not None else None
+        if not payment_method:
+            return 'Opção inválida. Responda com 1 (Pix), 2 (Cartão) ou 3 (Dinheiro).'
+
+        await _save_context(
+            chat_id,
+            {
+                'customer_name': customer_name,
+                'customer_address': customer_address,
+                'payment_method': payment_method,
+                'cart_items': json.dumps(cart_items),
+            },
+        )
+        await _set_state(chat_id, STATE_FINALIZACAO_CONFIRMACAO)
+
+        final_summary, _ = build_checkout_summary(cart_items, customer_address, payment_method)
+        return (
+            f'{final_summary}\n\n'
+            '✅ Confirma o pedido? Responda *SIM* para confirmar ou *NÃO* para voltar ao carrinho.'
+        )
+
+    if state == STATE_FINALIZACAO_CONFIRMACAO:
+        decision = _parse_yes_no(normalized_message)
+        if not decision:
+            return 'Responda *SIM* para confirmar ou *NÃO* para voltar ao carrinho.'
+
+        if decision == 'no':
+            await _set_state(chat_id, STATE_ADICIONANDO_CARRINHO)
+            summary, total = build_cart_summary(cart_items)
+            return _with_quick_commands(
+                f'Perfeito, voltamos para o carrinho.\n\n'
+                f'🛒 *Carrinho:*\n{summary}\n\n'
+                f'Total: *{format_brl(total)}*\n\n'
+                'Envie outro código, *carrinho* ou *finalizar*.'
+            )
+
+        payment_method = context.get('payment_method', '').strip()
+        if not payment_method:
+            await _set_state(chat_id, STATE_CHECKOUT_PAGAMENTO)
+            return get_payment_prompt_text()
+
+        if not customer_name:
+            await _set_state(chat_id, STATE_CHECKOUT_NOME)
+            return '🧾 Antes de concluir, me diga seu *nome completo*.'
+
+        if not customer_address:
+            await _set_state(chat_id, STATE_CHECKOUT_ENDERECO)
+            return '📦 Antes de concluir, me informe seu *endereço completo*.'
+
+        summary, total = build_cart_summary(cart_items)
+
+        try:
+            pedido = await save_order(
+                tenant_id=tenant_id,
+                phone=chat_id,
+                nome=customer_name,
+                endereco=customer_address,
+                cart_items=cart_items,
+                total=total,
+                forma_pagamento=payment_method,
+            )
+        except Exception as error:
+            log(f'Erro ao criar pedido no banco: {error}')
+            return '⚠️ Não consegui registrar seu pedido agora. Tente confirmar novamente em instantes.'
+
+        if ADMIN_WHATSAPP_NUMBER:
+            try:
+                admin_message = _build_admin_summary(pedido)
+                instance_name = await _get_instance_name(chat_id)
+                await asyncio.to_thread(
+                    send_whatsapp_message,
+                    ADMIN_WHATSAPP_NUMBER,
+                    admin_message,
+                    instance_name,
+                )
+            except Exception as error:
+                log(f'Falha ao notificar administrador: {error}')
+
+        await _save_context(
+            chat_id,
+            {
+                'customer_name': customer_name,
+                'customer_address': customer_address,
+                'payment_method': '',
+                'selected_parent_code': '',
+                'selected_quantity': '',
+            },
+        )
+        await clear_cart(chat_id)
+        await _set_state(chat_id, STATE_MENU_INICIAL)
+
+        final_summary, _ = build_checkout_summary(cart_items, customer_address, payment_method)
+        return (
+            '✅ *Pedido finalizado com sucesso!*\n\n'
+            f'{final_summary}\n\n'
+            '📦 Seu pedido foi enviado para separação.\n'
+            'Se quiser continuar comprando, responda com uma opção do menu.\n\n'
+            f'{get_main_menu_text()}'
+        )
+
+    await _set_state(chat_id, STATE_VERIFICACAO_INICIAL)
+    return 'Vamos reiniciar seu atendimento. Envie uma mensagem para começar.'
+
+
+async def buffer_message(
+    chat_id: str,
+    message: str,
+    tenant_id: str | None = None,
+    instance_name: str | None = None,
+):
+    buffer_key = f'{chat_id}{BUFFER_KEY_SUFIX}'
+
+    await _save_chat_runtime_context(
+        chat_id=chat_id,
+        tenant_id=(tenant_id or '').strip() or None,
+        instance_name=(instance_name or '').strip() or None,
+    )
 
     await redis_client.rpush(buffer_key, message)
     await redis_client.expire(buffer_key, BUFFER_TTL)
 
-    log(f'Mensagem adicionada ao buffer de {session_key}: {message}')
+    log(f'Mensagem adicionada ao buffer de {chat_id}: {message}')
 
-    if debounce_tasks.get(session_key):
-        debounce_tasks[session_key].cancel()
-        log(f'Debounce resetado para {session_key}')
+    if debounce_tasks.get(chat_id):
+        debounce_tasks[chat_id].cancel()
+        log(f'Debounce resetado para {chat_id}')
 
-    debounce_tasks[session_key] = asyncio.create_task(
-        handle_debounce(chat_id, tenant_id, instance_name)
-    )
+    debounce_tasks[chat_id] = asyncio.create_task(handle_debounce(chat_id))
 
 
-async def handle_debounce(chat_id: str, tenant_id: str, instance_name: str):
-    session_key = f'{tenant_id}:{chat_id}'
-    buffer_key = f'{session_key}{BUFFER_KEY_SUFIX}'
+async def handle_debounce(chat_id: str):
+    buffer_key = f'{chat_id}{BUFFER_KEY_SUFIX}'
 
     try:
-        log(f'Iniciando debounce para {session_key}')
+        log(f'Iniciando debounce para {chat_id}')
         await asyncio.sleep(float(DEBOUNCE_SECONDS))
 
         messages = await redis_client.lrange(buffer_key, 0, -1)
@@ -1349,48 +1418,30 @@ async def handle_debounce(chat_id: str, tenant_id: str, instance_name: str):
         full_message = ' '.join(messages).strip()
         if full_message:
             log(f'Enviando mensagem agrupada para {chat_id}: {full_message}')
-            reply_message = await process_message(chat_id, full_message, tenant_id, instance_name)
+            reply_message = await route_sales_flow(chat_id, full_message)
 
             if not reply_message:
                 await redis_client.delete(buffer_key)
                 return
 
             try:
-                send_whatsapp_presence(
-                    number=chat_id,
-                    presence='composing',
-                    delay=300,
-                    instance_name=instance_name,
-                )
+                await _send_presence(chat_id, presence='composing', delay=300)
             except Exception as error:
                 log(f'Falha ao enviar presença para {chat_id}: {error}')
 
             try:
-                send_whatsapp_message(
-                    number=chat_id,
-                    text=reply_message,
-                    instance_name=instance_name,
-                )
-                log(f'Resposta enviada para {chat_id}')
+                if isinstance(reply_message, list):
+                    await _send_message_sequence(chat_id, reply_message)
+                else:
+                    await _send_message(chat_id, str(reply_message))
             except Exception as error:
                 log(f'Falha ao enviar mensagem para {chat_id}: {error}')
-
-            # Persistência de pedido não deve depender do envio no WhatsApp.
-            # Se o resumo final foi gerado, salva no Kanban mesmo com falha de transporte.
-            try:
-                await _persist_ai_final_order_if_needed(
-                    chat_id=chat_id,
-                    tenant_id=tenant_id,
-                    reply_message=reply_message,
-                )
-            except Exception as error:
-                log(f'Falha ao persistir pedido após debounce para {chat_id}: {error}')
         await redis_client.delete(buffer_key)
 
     except asyncio.CancelledError:
-        log(f'Debounce cancelado para {session_key}')
+        log(f'Debounce cancelado para {chat_id}')
     except Exception as error:
-        log(f'Erro inesperado no debounce de {session_key}: {error}')
+        log(f'Erro inesperado no debounce de {chat_id}: {error}')
         fallback_message = (
             '⚠️ Tive um problema técnico para processar sua mensagem agora. '
             'Tente novamente em instantes ou digite *menu* para continuar.'
@@ -1401,7 +1452,7 @@ async def handle_debounce(chat_id: str, tenant_id: str, instance_name: str):
                 'Digite *menu* para continuar no atendimento ou tente novamente em instantes.'
             )
         try:
-            send_whatsapp_message(number=chat_id, text=fallback_message, instance_name=instance_name)
+            await _send_message(chat_id, fallback_message)
         except Exception as send_error:
             log(f'Falha ao enviar fallback para {chat_id}: {send_error}')
         try:
@@ -1409,7 +1460,7 @@ async def handle_debounce(chat_id: str, tenant_id: str, instance_name: str):
         except Exception as delete_error:
             log(f'Falha ao limpar buffer de {chat_id}: {delete_error}')
     finally:
-        current_task = debounce_tasks.get(session_key)
+        current_task = debounce_tasks.get(chat_id)
         running_task = asyncio.current_task()
         if current_task is running_task:
-            debounce_tasks.pop(session_key, None)
+            debounce_tasks.pop(chat_id, None)

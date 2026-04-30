@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any
 
 import asyncpg
+import requests
 
 from config import (
     BOT_ESTOQUE_DEFAULT_CATEGORY,
@@ -17,6 +18,8 @@ from config import (
 
 
 logger = logging.getLogger(__name__)
+
+NEXT_REVALIDATE_URL = 'http://whatsapp_saas_web:3000/api/revalidate'
 
 
 DEFAULT_TENANT_PROMPT = (
@@ -501,6 +504,21 @@ async def fetch_stock_for_context(tenant_id: str) -> dict:
                     tenant_id,
                 )
                 logger.info(f"[FETCH-STOCK] Bordas retornadas: {len(borda_rows)}")
+
+                bebida_rows = []
+                try:
+                    bebida_rows = await conn.fetch(
+                        '''
+                        SELECT nome, preco, ativo
+                        FROM bebidas
+                        WHERE tenant_id = $1
+                        ORDER BY created_at ASC
+                        ''',
+                        tenant_id,
+                    )
+                except Exception as bebida_error:
+                    logger.warning(f"[FETCH-STOCK] Query de bebidas indisponivel: {bebida_error}")
+                logger.info(f"[FETCH-STOCK] Bebidas retornadas: {len(bebida_rows)}")
                 
             except Exception as e:
                 logger.error(f"[FETCH-STOCK] Erro nas queries: {e}", exc_info=True)
@@ -545,24 +563,71 @@ async def fetch_stock_for_context(tenant_id: str) -> dict:
                     }
                 )
 
-            logger.info(f"[FETCH-STOCK-PIZZA] Retornando: {len(sabores)} sabores, {len(tamanhos)} tamanhos, {len(bordas)} bordas")
+            bebidas: list[dict[str, Any]] = []
+            for row in bebida_rows:
+                bebidas.append(
+                    {
+                        'nome': str(row.get('nome') or '').strip(),
+                        'preco': _to_float(row.get('preco') or 0),
+                        'disponivel': bool(row.get('ativo')),
+                    }
+                )
+
+            if not bebidas:
+                bebidas = [
+                    {'nome': 'Coca-Cola 600ml', 'preco': 6.0, 'disponivel': True},
+                    {'nome': 'Coca-Cola 2L', 'preco': 12.0, 'disponivel': True},
+                    {'nome': 'Guarana Antarctica 600ml', 'preco': 5.0, 'disponivel': True},
+                    {'nome': 'Guarana Antarctica 2L', 'preco': 10.0, 'disponivel': True},
+                    {'nome': 'Agua mineral 500ml', 'preco': 3.0, 'disponivel': True},
+                ]
+
+            logger.info(f"[FETCH-STOCK-PIZZA] Retornando: {len(sabores)} sabores, {len(tamanhos)} tamanhos, {len(bordas)} bordas, {len(bebidas)} bebidas")
             
             return {
                 'sub_nicho': 'pizzaria',
                 'sabores': sabores,
                 'tamanhos': tamanhos,
                 'bordas': bordas,
+                'bebidas': bebidas,
             }
 
         item_rows = await conn.fetch(
             '''
-            SELECT nome, preco, quantidade
+            SELECT id, nome, preco, variacao, tem_variacoes, quantidade, ativo
             FROM stock_items
             WHERE tenant_id = $1
             ORDER BY nome ASC
             ''',
             tenant_id,
         )
+
+        variacao_rows = []
+        adicional_rows = []
+        if sub_nicho == 'lanchonete':
+            variacao_rows = await conn.fetch(
+                '''
+                SELECT item_id, sigla, nome, preco, ordem
+                FROM item_variacoes
+                WHERE item_id IN (
+                    SELECT id FROM stock_items WHERE tenant_id = $1
+                )
+                ORDER BY ordem ASC, created_at ASC
+                ''',
+                tenant_id,
+            )
+            adicional_rows = await conn.fetch(
+                '''
+                SELECT item_id, nome, preco_extra
+                FROM item_adicionais
+                WHERE ativo = TRUE
+                    AND item_id IN (
+                        SELECT id FROM stock_items WHERE tenant_id = $1
+                    )
+                ORDER BY created_at ASC
+                ''',
+                tenant_id,
+            )
 
         combo_rows = []
         if sub_nicho == 'lanchonete':
@@ -594,16 +659,44 @@ async def fetch_stock_for_context(tenant_id: str) -> dict:
     import json as _json
 
     stock_map: dict[str, int] = {}
+    variacoes_por_item: dict[str, list[dict]] = {}
+    adicionais_por_item: dict[str, list[dict]] = {}
+    for row in variacao_rows:
+        item_id = str(row.get('item_id') or '').strip()
+        if not item_id:
+            continue
+        variacoes_por_item.setdefault(item_id, []).append({
+            'sigla': str(row.get('sigla') or '').strip(),
+            'nome': str(row.get('nome') or '').strip(),
+            'preco': _to_float(row.get('preco') or 0),
+        })
+
+    for row in adicional_rows:
+        item_id = str(row.get('item_id') or '').strip()
+        if not item_id:
+            continue
+        adicionais_por_item.setdefault(item_id, []).append({
+            'nome': str(row.get('nome') or '').strip(),
+            'preco_extra': _to_float(row.get('preco_extra') or 0),
+        })
+
     items: list[dict] = []
     for row in item_rows:
+        item_id = str(row['id'] or '').strip()
         nome = str(row['nome'] or '').strip()
         qty = int(row['quantidade'] or 0)
+        ativo = bool(row.get('ativo'))
+        disponivel = ativo if sub_nicho == 'lanchonete' else qty > 0
         stock_map[nome.lower()] = qty
         items.append({
             'nome': nome,
             'preco': _to_float(row['preco']),
+            'categoria': str(row.get('variacao') or 'Outros').strip() or 'Outros',
             'quantidade': qty,
-            'disponivel': qty > 0,
+            'disponivel': disponivel,
+            'tem_variacoes': bool(row.get('tem_variacoes')),
+            'variacoes': variacoes_por_item.get(item_id, []),
+            'adicionais': adicionais_por_item.get(item_id, []),
         })
 
     combos: list[dict] = []
@@ -917,6 +1010,15 @@ async def save_order(
         and int(item.get('quantity') or 0) > 0
     ).strip()
 
+    try:
+        requests.post(
+            NEXT_REVALIDATE_URL,
+            json={'tag': 'pedidos', 'tenant_id': normalized_tenant_id},
+            timeout=3,
+        )
+    except Exception:
+        pass
+
     return {
         'id': order_id,
         'criado_em': str(inserted_order.get('data_criacao') or ''),
@@ -932,41 +1034,106 @@ async def save_order(
 
 async def save_pizza_order(tenant_id: str, phone: str, session: dict[str, Any]) -> dict[str, Any] | None:
     """Persiste pedido finalizado do fluxo de pizzaria no mesmo pipeline de pedidos padrão."""
-    sabor = str(session.get('sabor') or session.get('sabor_sugerido') or '').strip()
-    tamanho = str(session.get('tamanho') or '').strip().upper()
-    tamanho_display = str(session.get('tamanho_display') or tamanho).strip()
-    borda = str(session.get('borda') or 'Sem borda').strip()
     endereco = str(session.get('endereco') or '').strip()
     pagamento = str(session.get('pagamento') or '').strip()
 
-    if not sabor or not endereco or not pagamento:
+    if not endereco or not pagamento:
         return None
 
-    quantidade = int(session.get('quantidade') or 1)
-    if quantidade <= 0:
-        quantidade = 1
+    carrinho = session.get('carrinho', [])
+    if not isinstance(carrinho, list):
+        carrinho = []
+
+    cart_items: list[dict[str, Any]] = []
+    total = 0.0
+
+    for pizza in carrinho:
+        sabor = str((pizza or {}).get('sabor') or '').strip()
+        tamanho = str((pizza or {}).get('tamanho') or '').strip().upper()
+        borda = str((pizza or {}).get('borda') or 'Sem borda').strip()
+        try:
+            preco = float((pizza or {}).get('preco') or 0)
+        except (TypeError, ValueError):
+            preco = 0.0
+
+        if not sabor:
+            continue
+
+        total += preco
+        borda_str = f' + {borda}' if borda and borda.lower() != 'sem borda' else ''
+        item_nome = f'{sabor} {tamanho}{borda_str}'.strip()
+
+        cart_items.append(
+            {
+                'product_name': item_nome,
+                'name': item_nome,
+                'quantity': 1,
+                'price': preco,
+            }
+        )
+
+    bebidas_carrinho = session.get('bebidas_carrinho', [])
+    if not isinstance(bebidas_carrinho, list):
+        bebidas_carrinho = []
+
+    for bebida in bebidas_carrinho:
+        nome = str((bebida or {}).get('nome') or '').strip()
+        if not nome:
+            continue
+
+        try:
+            preco = float((bebida or {}).get('preco') or 0)
+        except (TypeError, ValueError):
+            preco = 0.0
+
+        try:
+            quantidade = int((bebida or {}).get('quantidade') or 1)
+        except (TypeError, ValueError):
+            quantidade = 1
+        if quantidade <= 0:
+            quantidade = 1
+
+        total += preco * quantidade
+        cart_items.append(
+            {
+                'product_name': nome,
+                'name': nome,
+                'quantity': quantidade,
+                'price': preco,
+            }
+        )
+
+    # Compatibilidade com sessões antigas sem carrinho.
+    if not cart_items:
+        sabor_legacy = str(session.get('sabor') or session.get('sabor_sugerido') or '').strip()
+        tamanho_legacy = str(session.get('tamanho') or '').strip().upper()
+        borda_legacy = str(session.get('borda') or 'Sem borda').strip()
+        if not sabor_legacy:
+            return None
+
+        try:
+            total_legacy = float(session.get('total') or 0)
+        except (TypeError, ValueError):
+            total_legacy = 0.0
+
+        borda_str = f' + {borda_legacy}' if borda_legacy and borda_legacy.lower() != 'sem borda' else ''
+        item_nome = f'{sabor_legacy} {tamanho_legacy}{borda_str}'.strip()
+        cart_items.append(
+            {
+                'product_name': item_nome,
+                'name': item_nome,
+                'quantity': 1,
+                'price': total_legacy,
+            }
+        )
+        total = total_legacy
 
     try:
-        total = float(session.get('total') or 0)
+        total_from_session = float(session.get('total') or 0)
     except (TypeError, ValueError):
-        total = 0.0
-
-    # O fluxo calcula total já com quantidade; salvar item com preço unitário.
-    preco_unitario = total / quantidade if quantidade > 0 else total
-
-    tamanho_texto = tamanho_display or tamanho
-    item_nome = f'{sabor} {tamanho_texto}'.strip()
-    if borda and borda.lower() != 'sem borda':
-        item_nome = f'{item_nome} + {borda}'
-
-    cart_items = [
-        {
-            'product_name': item_nome,
-            'name': item_nome,
-            'quantity': quantidade,
-            'price': preco_unitario,
-        }
-    ]
+        total_from_session = 0.0
+    if total <= 0 and total_from_session > 0:
+        total = total_from_session
 
     return await save_order(
         tenant_id=tenant_id,
