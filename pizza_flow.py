@@ -383,15 +383,6 @@ def is_close_order(text: str) -> bool:
     return _extract_with_patterns(_norm(text), CLOSE_ORDER_PATTERNS)
 
 
-def _find_by_name(options: list[dict[str, Any]], field: str, value: str) -> dict[str, Any] | None:
-    target = _normalize_text(value).lower()
-    for item in options:
-        current = _normalize_text(str(item.get(field) or '')).lower()
-        if current == target:
-            return item
-    return None
-
-
 def _get_sabor_price(sabor_obj: dict[str, Any] | None, tamanho_sigla: str, tamanho_obj: dict[str, Any] | None) -> float:
     if not sabor_obj:
         return 0.0
@@ -451,22 +442,6 @@ def _adicionar_ao_carrinho(
     )
     session['pizza_atual'] = {}
     return session
-
-
-def _resumo_carrinho(carrinho: list[dict[str, Any]]) -> str:
-    linhas: list[str] = []
-    for p in carrinho:
-        sabor = str(p.get('sabor') or '').strip()
-        tamanho = str(p.get('tamanho') or '').strip()
-        borda = str(p.get('borda') or 'Sem borda').strip()
-        try:
-            preco = float(p.get('preco') or 0)
-        except (TypeError, ValueError):
-            preco = 0.0
-
-        borda_str = f' + {borda}' if borda and borda.lower() != 'sem borda' else ''
-        linhas.append(f'🍕 {sabor} {tamanho}{borda_str} — R${preco:.2f}'.replace('.', ','))
-    return '\n'.join(linhas)
 
 
 def resumo_pizzas_com_pergunta(session: dict[str, Any]) -> str:

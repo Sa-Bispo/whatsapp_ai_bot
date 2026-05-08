@@ -31,20 +31,3 @@ def get_session_history(session_id):
         return history
     except Exception:
         return _get_fallback_history(normalized_session_id)
-
-
-def clear_session_history(session_id: str) -> None:
-    normalized_session_id = str(session_id or '').strip() or 'default-session'
-
-    if not REDIS_URL:
-        _fallback_histories.pop(normalized_session_id, None)
-        return
-
-    try:
-        history = RedisChatMessageHistory(
-            session_id=normalized_session_id,
-            url=REDIS_URL,
-        )
-        history.clear()
-    except Exception:
-        _fallback_histories.pop(normalized_session_id, None)

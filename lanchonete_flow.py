@@ -341,25 +341,6 @@ def formatar_confirmacao_item(
     return "\n".join(linhas)
 
 
-def formatar_resumo_carrinho(carrinho: list) -> str:
-    if not carrinho:
-        return "Carrinho vazio ainda. O que você quer pedir? 🥪"
-    linhas = ["🛒 *Seu pedido até agora:*\n"]
-    total = 0.0
-    for item in carrinho:
-        qty = item.get("quantidade", 1)
-        preco_unit = float(item.get("preco", 0))
-        subtotal = preco_unit * qty
-        total += subtotal
-        preco_fmt = f"R${subtotal:.2f}".replace(".", ",")
-        qty_str = f"{qty}x " if qty > 1 else ""
-        linhas.append(f"• {qty_str}{item['nome']} — {preco_fmt}")
-    total_fmt = f"R${total:.2f}".replace(".", ",")
-    linhas.append(f"\n💰 *Total: {total_fmt}*")
-    linhas.append("\nMais alguma coisa ou pode fechar? 😊")
-    return "\n".join(linhas)
-
-
 def mais_itens_com_carrinho(session: dict) -> str:
     carrinho = session.get("carrinho", [])
 

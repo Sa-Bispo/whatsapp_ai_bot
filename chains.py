@@ -681,25 +681,12 @@ def _normalize_objective(value: str | None) -> str:
     return 'FECHAR_PEDIDO'
 
 
-def _detect_product(text: str) -> bool:
-    normalized = (text or '').lower()
-    return any(
-        token in normalized
-        for token in ('pizza', 'lanche', 'hamburg', 'combo', 'produto', 'pedido', 'quero')
-    )
-
-
 def _detect_size_or_quantity(text: str) -> bool:
     normalized = (text or '').lower()
     return bool(
         re.search(r'\b(\d+)\b', normalized)
         or any(token in normalized for token in ('p ', 'm ', 'g ', 'grande', 'medio', 'médio', 'pequena', 'pequeno', 'tamanho'))
     )
-
-
-def _detect_payment(text: str) -> bool:
-    normalized = (text or '').lower()
-    return any(token in normalized for token in ('pix', 'cartao', 'cartão', 'dinheiro', 'dinheirinho', 'credito', 'crédito', 'debito', 'débito'))
 
 
 def _detect_name(text: str) -> bool:
@@ -854,19 +841,6 @@ def _extract_address_from_text(text: str) -> str:
         address,
     ).strip(' ,.-')
     return address
-
-
-def _extract_latest_address(history_window, user_message: str) -> str:
-    human_texts = [str(msg.content).strip() for msg in history_window if msg.type == 'human']
-    if user_message.strip():
-        human_texts.append(user_message.strip())
-
-    for text in reversed(human_texts):
-        address = _extract_address_from_text(text)
-        if address:
-            return address
-
-    return '[endereço informado pelo cliente]'
 
 
 def _normalize_catalog_lookup(value: str) -> str:
@@ -1358,11 +1332,6 @@ def _enforce_sales_funnel(
         return cleaned
 
     return f'{cleaned} {next_question}'.strip()
-
-
-def _openai_key_is_configured() -> bool:
-    key = (OPENAI_API_KEY or '').strip()
-    return bool(key and key.upper() != 'YOUR_KEY')
 
 
 def _provider_unavailable_fallback(

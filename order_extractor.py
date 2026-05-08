@@ -738,63 +738,6 @@ def build_order_payload_from_texts(
     }
 
 
-async def build_structured_order_payload(
-    session_key: str,
-    tenant_id: str | None,
-    fallback_items_text: str = '',
-    fallback_address: str = '',
-    fallback_payment: str = '',
-) -> dict[str, Any]:
-    history = get_session_history(session_key)
-    human_texts = collect_active_human_texts(list(history.messages))
-
-    stock_data: dict[str, Any] = {}
-    normalized_tenant_id = (tenant_id or '').strip()
-    if normalized_tenant_id:
-        try:
-            stock_data = await fetch_stock_for_context(normalized_tenant_id)
-        except Exception:
-            stock_data = {}
-
-    payload = build_order_payload_from_texts(
-        human_texts=human_texts,
-        tenant_id=normalized_tenant_id,
-        stock_data=stock_data,
-        fallback_items_text=fallback_items_text,
-        fallback_address=fallback_address,
-        fallback_payment=fallback_payment,
-    )
-
-    phone = ''
-    if ':' in session_key:
-        parts = session_key.split(':', 1)
-        if len(parts) == 2:
-            phone = parts[1].strip()
-
-    if (
-        _redis_client is not None
-        and normalized_tenant_id
-        and phone
-        and bool((payload.get('analytics') or {}).get('produto_confirmado'))
-    ):
-        try:
-            await _redis_client.setex(
-                _produto_confirmado_key(normalized_tenant_id, phone),
-                _PRODUCT_CONFIRMED_TTL_SECONDS,
-                '1',
-            )
-        except Exception:
-            pass
-
-    # DEBUG: Log das quantidades extraídas
-    cart_items = payload.get('order', {}).get('items', [])
-    logger.info(f"[EXTRATOR] cart_items antes do resumo: {cart_items}")
-    for item in cart_items:
-        logger.info(f"[EXTRATOR] quantidade extraída: {item.get('quantity')} para {item.get('product_name')}")
-
-    return payload
-
-
 def build_order_payload_from_history_window(
     history_window,
     user_message: str,

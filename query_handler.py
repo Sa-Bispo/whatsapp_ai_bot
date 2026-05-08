@@ -50,15 +50,6 @@ def is_product_query(text: str) -> bool:
     return False
 
 
-def is_resuming_order(text: str) -> bool:
-    """Detecta se o cliente está voltando ao fluxo de pedido."""
-    text_lower = text.lower()
-    for pattern in ORDER_RESUME_PATTERNS:
-        if re.search(pattern, text_lower):
-            return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Handler principal
 # ---------------------------------------------------------------------------

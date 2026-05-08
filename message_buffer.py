@@ -151,14 +151,6 @@ def get_main_menu_text() -> str:
     )
 
 
-def get_store_info_text() -> str:
-    return (
-        '📍 *Informações da Loja*\n'
-        'Endereço: Av. Vitalidade, 350 - Centro\n'
-        'Horário: Segunda a Sábado, 08h às 20h'
-    )
-
-
 def get_whey_guidance_text() -> str:
     return (
         'Boa escolha! Whey é fundamental para a recuperação e ganho de massa. 💪🥩\n\n'
@@ -217,21 +209,6 @@ def _number_emoji(index: int) -> str:
     return mapping.get(index, str(index))
 
 
-def get_categories_text(categories: list[dict]) -> str:
-    lines = [
-        '📚 *Categorias do Catálogo*',
-        'Responda com o número da categoria desejada:',
-    ]
-
-    for index, category in enumerate(categories, start=1):
-        lines.append(f"{_number_emoji(index)} - {category['categoria']}")
-
-    lines.append('0️⃣ - Ver todos os produtos')
-    lines.append('')
-    lines.append(QUICK_COMMANDS_TEXT)
-    return '\n'.join(lines)
-
-
 def get_variation_options_text(product_group: dict) -> str:
     lines = [
         f"💊 *{product_group['nome_produto']}*",
@@ -244,14 +221,6 @@ def get_variation_options_text(product_group: dict) -> str:
     return '\n'.join(lines)
 
 
-def get_upsell_prompt_text() -> str:
-    return (
-        '🔥 Aproveitando: quem compra suplementos geralmente leva uma Coqueteleira para os treinos.\n'
-        'Deseja adicionar uma por *R$ 25,00*?\n'
-        'Responda *SIM* ou *NÃO*.'
-    )
-
-
 def get_payment_prompt_text() -> str:
     return (
         '💳 Qual será a forma de pagamento na entrega?\n'
@@ -260,25 +229,6 @@ def get_payment_prompt_text() -> str:
         '2 - Cartão\n'
         '3 - Dinheiro'
     )
-
-
-def parse_item_message(user_message: str):
-    tokens = user_message.strip().replace(',', '.').split()
-    if not tokens:
-        return None, None
-
-    code = tokens[0].strip().lower()
-
-    quantity = 1
-    if len(tokens) > 1:
-        if not tokens[1].isdigit():
-            return None, None
-        quantity = int(tokens[1])
-
-    if quantity <= 0:
-        return None, None
-
-    return code, quantity
 
 
 def format_brl(value: float) -> str:
@@ -675,17 +625,6 @@ def _add_item_to_cart(
             'quantity': quantity,
         }
     )
-
-
-async def _send_product_media_if_available(chat_id: str, product_group: dict, caption: str):
-    media_url = str(product_group.get('imagem_url', '')).strip()
-    if not _is_valid_media_url(media_url):
-        return
-
-    try:
-        await _send_media(chat_id, caption, media_url)
-    except Exception as error:
-        log(f'Falha ao enviar imagem do produto: {error}')
 
 
 async def _send_welcome_sequence(chat_id: str):
